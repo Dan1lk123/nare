@@ -1,27 +1,4 @@
-"""
-Session Management Module
-
-Component: NareSession
-Purpose: Manages NARE agent lifecycle and query execution
-Architecture: Thin wrapper over NARE core, handles CLI-specific concerns
-
-Responsibilities:
-- Initialize NARE agent with proper configuration
-- Manage context files (loaded via /read command)
-- Triage user queries before routing
-- Provide file access to NARE core
-- Track session metadata
-
-Dependencies:
-- NAREProductionAgent: Core reasoning engine
-- TriageAgent: Intent classifier (QUESTION/EXPLORE/EDIT)
-- NareConfig: Configuration management
-
-Lifecycle:
-1. __init__ - set repository path
-2. init_agent - lazy initialize NARE + triage
-3. solve - execute query through NARE pipeline
-"""
+"""Session management for NARE CLI."""
 
 import os
 import time
@@ -34,34 +11,17 @@ from typing import Optional
 
 log = get_logger("nare.cli.session")
 
+COMPACT_THRESHOLD = 10
+MAX_HISTORY_MESSAGES = 20
+HISTORY_KEEP_FIRST = 2
+HISTORY_KEEP_LAST = 18
+MAX_CONTENT_PER_MESSAGE = 1000
+MAX_REPO_MAP_CHARS = 5000
+
+
 class NareSession:
-    """Session manager for NARE CLI.
-
-    Responsibilities:
-    - Initialize NARE agent with proper config
-    - Manage context files (loaded via /read)
-    - Triage user queries before routing
-    - Provide file access to NARE core
-
-    Lifecycle:
-    1. __init__ - set repo path
-    2. init_agent - lazy init NARE + triage
-    3. solve - execute query through NARE
-
-    Attributes:
-        repo_path: Working directory for file operations
-        agent: NAREProductionAgent instance (lazy init)
-        triage: TriageAgent instance (lazy init)
-        context_files: Files loaded via /read command
-    """
 
     def __init__(self, repo_path: str = ".", autonomy_level: AutonomyLevel = AutonomyLevel.ASSISTED):
-        """Initialize session with repository path.
-
-        Args:
-            repo_path: Working directory for file operations
-            autonomy_level: How much freedom agent has to act
-        """
         self.repo_path = os.path.abspath(repo_path)
         self.autonomy_level = autonomy_level
         self.agent = None
@@ -76,7 +36,7 @@ class NareSession:
         self._repo_map_cache: Optional[str] = None
         self._repo_map_time: float = 0.0
 
-        env_flag = os.getenv("NARE_AGENT_LOOP", "0").strip().lower()  # Changed default to "0" (off)
+        env_flag = os.getenv("NARE_AGENT_LOOP", "0").strip().lower()
         self.use_agent_loop: bool = env_flag not in ("0", "false", "off", "no")
         self._agent_loop = None
 
@@ -96,96 +56,41 @@ class NareSession:
 
         if not os.path.exists(nare_md_path):
             try:
-                template = """# NARE Project Rules
-
-## Token Economy (CRITICAL)
-- Use grep/find BEFORE reading files - точечное чтение экономит 90% токенов
-- Read files only once - check OBSERVATION blocks for cached content
-- After 3 read operations, MUST edit or answer - жесткий лимит
-- Don't explore without specific goal - расплывчатые задачи = трата токенов
-- Use find_function → apply_hunks instead of read → write (saves 93% tokens)
-
-## Context Hygiene
-- Agent auto-compacts context after 12 observations (keeps last 10)
-- Use .nareignore to exclude: logs/, dist/, build/, node_modules/, __pycache__/
-
-## Anti-Hallucination (CRITICAL)
-- ALWAYS read file before claiming to know its contents
-- NEVER assume function signatures - verify with grep/read
-- Test changes with bash before claiming success
-
-## Response Style
-- Be concise - no explanations unless asked
-- Focus on code changes only
-- No "размышления вслух" - output tokens cost more
-
-## Project-Specific Notes
-(Add your project structure, common patterns, and shortcuts here)
-"""
+                template = (
+                    "# NARE Project Rules\n\n"
+                    "## Token Economy\n"
+                    "- Use grep/find BEFORE reading files\n"
+                    "- Read files only once, check OBSERVATION blocks for cached content\n"
+                    "- After 3 read operations, MUST edit or answer\n"
+                    "- Use find_function + apply_hunks instead of read + write\n\n"
+                    "## Context Hygiene\n"
+                    "- Agent auto-compacts context after 12 observations (keeps last 10)\n"
+                    "- Use .nareignore to exclude build artifacts\n\n"
+                    "## Anti-Hallucination\n"
+                    "- ALWAYS read file before claiming to know its contents\n"
+                    "- NEVER assume function signatures - verify with grep/read\n"
+                    "- Test changes with bash before claiming success\n\n"
+                    "## Response Style\n"
+                    "- Be concise, no explanations unless asked\n"
+                    "- Focus on code changes only\n"
+                )
                 with open(nare_md_path, 'w', encoding='utf-8') as f:
                     f.write(template)
-                log.info(f"[Session] Created NARE.md at {nare_md_path}")
             except Exception as e:
                 log.debug(f"[Session] Failed to create NARE.md: {e}")
 
         if not os.path.exists(nareignore_path):
             try:
-                ignore_template = """# NARE ignore patterns - exclude from context to save tokens
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Node
-node_modules/
-npm-debug.log
-yarn-error.log
-
-# Logs
-*.log
-logs/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Git
-.git/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Large files
-*.mp4
-*.avi
-*.mov
-*.zip
-*.tar.gz
-*.rar
-
-# Temporary
-tmp/
-temp/
-*.tmp
-"""
+                ignore_lines = [
+                    "__pycache__/", "*.pyc", "*.pyo", "dist/", "build/",
+                    ".pytest_cache/", ".coverage", "htmlcov/",
+                    "node_modules/", "*.log", "logs/",
+                    ".vscode/", ".idea/", ".git/",
+                    ".DS_Store", "*.mp4", "*.zip", "*.tar.gz",
+                    "tmp/", "temp/", "*.tmp",
+                ]
                 with open(nareignore_path, 'w', encoding='utf-8') as f:
-                    f.write(ignore_template)
-                log.info(f"[Session] Created .nareignore at {nareignore_path}")
+                    f.write("\n".join(ignore_lines) + "\n")
             except Exception as e:
                 log.debug(f"[Session] Failed to create .nareignore: {e}")
 
@@ -196,49 +101,70 @@ temp/
         return os.path.join(memory_dir, "chat_history.json")
 
     def _save_chat_history(self):
-        """Save chat history to disk with token optimization."""
+        """Save chat history to disk with aggressive token optimization."""
         try:
             import re
 
-            # Trim history for token efficiency
-            trimmed_history = []
+            trimmed = []
             for msg in self.chat_history:
-                trimmed_msg = msg.copy()
                 content = msg.get("content", "")
-
-                # Remove <reasoning> blocks
                 content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL)
+                content = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', content, flags=re.DOTALL)
 
-                def truncate_code(match):
+                def _truncate_code(match):
                     lang = match.group(1)
                     code = match.group(2)
-
-                    # Increased limit
-                    max_code_len = 500
-
-                    if len(code) > max_code_len:
-                        # Smart truncation: preserve start and end
-                        lines = code.splitlines()
-                        if len(lines) > 20:
-                            # Keep first 10 and last 5 lines
-                            kept_lines = lines[:10] + ['...'] + lines[-5:]
-                            truncated = '\n'.join(kept_lines)
-                            return f"```{lang}\n{truncated}\n```"
-                        else:
-                            # Just truncate by characters
-                            return f"```{lang}\n{code[:max_code_len]}...\n```"
+                    lines = code.splitlines()
+                    if len(lines) > 15:
+                        kept = lines[:8] + ['...'] + lines[-4:]
+                        return f"```{lang}\n" + '\n'.join(kept) + "\n```"
                     return match.group(0)
 
-                content = re.sub(r'```(\w*)\n(.*?)\n```', truncate_code, content, flags=re.DOTALL)
+                content = re.sub(r'```(\w*)\n(.*?)\n```', _truncate_code, content, flags=re.DOTALL)
+                if len(content) > MAX_CONTENT_PER_MESSAGE:
+                    content = content[:MAX_CONTENT_PER_MESSAGE] + "... (truncated)"
 
-                trimmed_msg["content"] = content
-                trimmed_history.append(trimmed_msg)
+                trimmed.append({"role": msg["role"], "content": content})
 
             history_path = self._get_history_path()
             with open(history_path, 'w', encoding='utf-8') as f:
-                json.dump(trimmed_history, f, ensure_ascii=False, indent=2)
+                json.dump(trimmed, f, ensure_ascii=False)
         except Exception as e:
             log.warning(f"[Session] Failed to save chat history: {e}")
+
+    def compact_history(self) -> str:
+        """Compress chat history into a summary to free context space."""
+        if len(self.chat_history) < COMPACT_THRESHOLD:
+            return "History too short to compact."
+
+        messages_to_compact = self.chat_history[:-4]
+        kept = self.chat_history[-4:]
+
+        summary_parts = []
+        for msg in messages_to_compact:
+            role = msg["role"].upper()
+            content = msg.get("content", "")[:200]
+            summary_parts.append(f"{role}: {content}")
+
+        summary = (
+            f"[COMPACTED HISTORY: {len(messages_to_compact)} messages]\n"
+            + "\n".join(summary_parts)
+        )
+
+        self.chat_history = [
+            {"role": "assistant", "content": summary}
+        ] + kept
+        self._save_chat_history()
+
+        return f"Compacted {len(messages_to_compact)} messages into summary."
+
+    def _trim_history(self):
+        """Trim history to stay within token budget."""
+        if len(self.chat_history) > MAX_HISTORY_MESSAGES:
+            self.chat_history = (
+                self.chat_history[:HISTORY_KEEP_FIRST]
+                + self.chat_history[-HISTORY_KEEP_LAST:]
+            )
 
     def _load_chat_history(self):
         """Load chat history from disk."""
@@ -253,29 +179,17 @@ temp/
             self.chat_history = []
 
     def _generate_repo_map(self) -> str:
-        """Generate a compact tree representation of the repository."""
+        """Generate a semantic skeleton of the repository."""
         from nare.core.repo_map import generate_repo_map
         return generate_repo_map(
             repo_path=self.repo_path,
-            max_files=1500,
-            max_chars=15000,
+            max_files=200,
+            max_chars=MAX_REPO_MAP_CHARS,
             use_cache=True,
+            active_files=set(self.context_files.keys()) if self.context_files else None,
         )
 
     def init_agent(self):
-        """Initialize NARE agent and triage classifier.
-
-        Components initialized:
-        - NAREProductionAgent: Core reasoning engine
-        - TriageAgent: Intent classifier (QUESTION/EXPLORE/EDIT)
-
-        Config:
-        - Memory: .nare_memory/ in repo
-        - Embeddings: 3072-dim (BGE-large)
-        - Synthesis: max 8 attempts
-
-        Performance: First call loads embedding model (~10s), then cached.
-        """
         if self.agent is not None:
             return
 
@@ -288,23 +202,19 @@ temp/
         config = NareConfig(synthesis=SynthesisConfig(max_attempts=8))
         self.config = config  # Store config for later use
 
-        # Phase 3: Clean Slate Memory Isolation
         import hashlib
         import shutil
-        
-        # Wipe legacy flat memory format to prevent confusion
+
         legacy_dir = os.path.join(self.repo_path, ".nare_memory")
         if os.path.exists(legacy_dir):
             try:
                 shutil.rmtree(legacy_dir, ignore_errors=True)
-                log.info(f"[Session] Wiped legacy memory at {legacy_dir}")
             except Exception:
                 pass
-                
+
         project_id = hashlib.md5(os.path.abspath(self.repo_path).encode('utf-8')).hexdigest()[:12]
         persist_dir = os.path.expanduser(f"~/.nare/projects/{project_id}/memory")
         
-        # Ensure central directory exists
         os.makedirs(persist_dir, exist_ok=True)
 
         self.agent = NAREProductionAgent(
@@ -313,7 +223,6 @@ temp/
             embedding_dim=1024,
         )
 
-        # Create EventBus for Router and attach renderer
         from nare.core.events import EventBus
         from nare.cli.display.agent_renderer import attach_renderer
         from nare.cli.display import console as _shared_console
@@ -324,18 +233,16 @@ temp/
 
         self.triage = TriageAgent()
 
-        # Seed common queries for FAST route
         try:
             from nare.memory.seed_common_queries import seed_memory
             seed_memory(self.agent.memory)
-            log.info(f"[Session] Seeded common queries to memory")
         except Exception as e:
             log.warning(f"[Session] Failed to seed common queries: {e}")
 
         log.info(f"[Session] NARE initialized in {self.repo_path}")
 
     def _ensure_agent_loop(self):
-        """Lazy-init the AgentLoop and wire its bus into the CLI renderer."""
+        """Lazy-init the AgentLoop."""
         if self._agent_loop is not None:
             return self._agent_loop
 

@@ -51,20 +51,33 @@ def _ensure_api_key():
             "export it in the current shell. See .env.example for details."
         )
 
+def _make_cached_system(system_prompt: str) -> list:
+    """Split system prompt into cacheable static block."""
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"}
+    }]
+
+
 def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
-    """POST to the configured LLM endpoint using stdlib urllib."""
+    """POST to the configured LLM endpoint with prompt caching support."""
     import urllib.request
     import urllib.error
 
     if stream_callback:
         payload['stream'] = True
 
+    if 'system' in payload and isinstance(payload['system'], str):
+        payload['system'] = _make_cached_system(payload['system'])
+
     url = f"{ANTHROPIC_BASE_URL}/{endpoint}"
     data = json.dumps(payload).encode('utf-8')
     headers = {
         'Content-Type': 'application/json',
         'x-api-key': ANTHROPIC_AUTH_TOKEN,
-        'anthropic-version': '2023-06-01'
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'prompt-caching-2024-07-31'
     }
 
     retries = 5
@@ -143,32 +156,46 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
                     return body_str
 
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else ''
+            error_body = ''
+            try:
+                error_body = e.read().decode('utf-8', errors='replace')
+            except Exception:
+                pass
             if e.code == 429:
                 base_wait = min(10 * (2 ** attempt), 60)
                 jitter = random.uniform(0, base_wait * 0.1)
                 wait_time = base_wait + jitter
-                logging.warning(f"Rate limit (429). Waiting {wait_time:.1f}s... (Attempt {attempt+1}/{retries})")
+                logging.warning(f"Rate limit (429). Retrying in {wait_time:.1f}s (attempt {attempt+1}/{retries})")
                 if attempt < retries - 1:
                     time.sleep(wait_time)
                     continue
-                else:
-                    raise Exception("Max retries exceeded for API request.")
-            elif e.code == 400:
-                logging.error(f"HTTP 400 Bad Request. Response: {error_body[:500]}")
-                raise
+                raise RuntimeError("Max retries exceeded (429)")
+            elif e.code in (500, 502, 503, 504):
+                if attempt < retries - 1:
+                    wait_time = min(5 * (2 ** attempt), 30)
+                    logging.warning(f"HTTP {e.code}, retrying in {wait_time}s (attempt {attempt+1}/{retries})")
+                    time.sleep(wait_time)
+                    continue
+                raise RuntimeError(f"LLM HTTP {e.code}: {error_body[:300]}")
             else:
-                logging.error(f"HTTP {e.code}. Response: {error_body[:500]}")
-                raise
+                raise RuntimeError(f"LLM HTTP {e.code}: {error_body[:300]}")
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                wait_time = min(5 * (2 ** attempt), 30)
+                logging.warning(f"Connection error (attempt {attempt+1}/{retries}): {e}")
+                time.sleep(wait_time)
+                continue
+            raise RuntimeError(f"LLM connection failed: {e}")
+        except RuntimeError:
+            raise
         except Exception as e:
             if attempt == retries - 1:
-                raise
+                raise RuntimeError(f"LLM API error: {e}")
             wait_time = min(5 * (2 ** attempt), 30)
             logging.warning(f"LLM API error (attempt {attempt+1}/{retries}): {e}")
-            if attempt < retries - 1:
-                time.sleep(wait_time)
+            time.sleep(wait_time)
 
-    raise Exception("Max retries exceeded for LLM API")
+    raise RuntimeError("LLM max retries exceeded")
 
 _embedding_model = None
 
