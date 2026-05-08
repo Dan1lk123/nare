@@ -275,30 +275,12 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
         in_solution = False
         in_abstract = False
         in_tool_call = False
-        in_xml_tool = False
-        xml_tool_name = ""
-        xml_tool_buffer = ""
         buffer = ""
         seen_first_tag = False
         tool_call_buffer = ""
 
-        _XML_TOOL_TAGS = ('read_file', 'create_file', 'edit_file', 'list_files', 'write_file')
-
-        def _execute_xml_tool(tool_tag: str, content: str):
-            """Execute an XML-style tool call and return result."""
-            try:
-                from nare.tools.parsing.executor import parse_tool_calls, execute_tool_call
-                fake_xml = f'<{tool_tag}>{content}</{tool_tag}>'
-                calls = parse_tool_calls(fake_xml)
-                if calls:
-                    result = execute_tool_call(calls[0]['tool'], calls[0]['args'], working_dir='.')
-                    return result
-            except Exception as e:
-                logging.warning(f'[XML_TOOL] Failed to execute {tool_tag}: {e}')
-            return None
-
         def callback(token: str):
-            nonlocal in_reasoning, in_delta, in_solution, in_abstract, in_tool_call, in_xml_tool, xml_tool_name, xml_tool_buffer, buffer, seen_first_tag, tool_call_buffer
+            nonlocal in_reasoning, in_delta, in_solution, in_abstract, in_tool_call, buffer, seen_first_tag, tool_call_buffer
             buffer += token
 
             # ALWAYS filter out <tool_call> blocks first (with whitespace handling)
@@ -397,16 +379,7 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                                 display_verb=None
                             ))
 
-                            # Stream tool result immediately so it appears in real-time
-                            if thinking_display:
-                                # Ensure we're in solution mode before streaming results
-                                if hasattr(thinking_display, 'mode') and thinking_display.mode != 'solution':
-                                    if hasattr(thinking_display, 'switch_to_solution'):
-                                        thinking_display.switch_to_solution()
-
-                                thinking_display.stream_token(f"\n{result_msg}\n")
-
-                            # Also append to _tool_results for final answer assembly
+                            # Append tool result to solution so it appears in final answer
                             if hasattr(thinking_display, '_tool_results'):
                                 thinking_display._tool_results.append(f"\n{result_msg}")
                             else:
@@ -435,6 +408,7 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
             if "<reasoning>" in buffer and not in_reasoning:
                 in_reasoning = True
                 seen_first_tag = True
+
                 buffer = buffer.split("<reasoning>", 1)[1]
                 return
 
@@ -455,93 +429,49 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
             if in_reasoning:
                 if "</reasoning>" in buffer:
-                    before = buffer.split("</reasoning>", 1)[0]
-                    if before.strip():
-                        thinking_display.stream_token(before)
+
+                    final_text = buffer.split("</reasoning>", 1)[0]
+                    if final_text:
+                        thinking_display.stream_token(final_text)
                     in_reasoning = False
                     buffer = ""
                 else:
-                    thinking_display.stream_token(buffer)
-                    buffer = ""
+                    partial_tags = ['<', '</', '</r', '</re', '</rea', '</reas', '</reaso', '</reason', '</reasoni', '</reasonin']
+                    if not any(buffer.endswith(p) for p in partial_tags):
+                        if buffer:
+                            thinking_display.stream_token(buffer)
+                        buffer = ""
             elif in_delta:
                 if "</delta_reasoning>" in buffer:
-                    before = buffer.split("</delta_reasoning>", 1)[0]
-                    if before.strip():
-                        thinking_display.stream_token(before)
+                    final_text = buffer.split("</delta_reasoning>", 1)[0]
+                    if final_text:
+                        thinking_display.stream_token(final_text)
                     in_delta = False
                     buffer = ""
                 else:
-                    thinking_display.stream_token(buffer)
-                    buffer = ""
+                    partial_tags = ['<', '</', '</d', '</de', '</del', '</delt', '</delta', '</delta_', '</delta_r', '</delta_re', '</delta_rea', '</delta_reas', '</delta_reaso', '</delta_reason', '</delta_reasoni', '</delta_reasonin', '</delta_reasoning']
+                    if not any(buffer.endswith(p) for p in partial_tags):
+                        if buffer:
+                            thinking_display.stream_token(buffer)
+                        buffer = ""
             elif in_solution:
-                # Handle XML tool call accumulation
-                if in_xml_tool:
-                    xml_tool_buffer += buffer
-                    buffer = ""
-                    close_tag = f'</{xml_tool_name}>'
-                    if close_tag in xml_tool_buffer:
-                        content = xml_tool_buffer.split(close_tag, 1)[0]
-                        remainder = xml_tool_buffer.split(close_tag, 1)[1]
-                        in_xml_tool = False
-
-                        result = _execute_xml_tool(xml_tool_name, content)
-                        xml_tool_name = ""
-                        xml_tool_buffer = ""
-
-                        if result:
-                            thinking_display.stream_token(f"\n{result}\n")
-                            if hasattr(thinking_display, '_tool_results'):
-                                thinking_display._tool_results.append(f"\n{result}")
-                            else:
-                                thinking_display._tool_results = [f"\n{result}"]
-
-                        if remainder.strip():
-                            buffer = remainder
-                    return
-
-                # Check for XML tool call opening tags in buffer
-                import re as _re
-                xml_tool_match = _re.search(r'<(' + '|'.join(_XML_TOOL_TAGS) + r')>', buffer)
-                if xml_tool_match:
-                    before = buffer[:xml_tool_match.start()]
-                    if before.strip():
-                        thinking_display.stream_token(before)
-                    in_xml_tool = True
-                    xml_tool_name = xml_tool_match.group(1)
-                    xml_tool_buffer = buffer[xml_tool_match.end():]
-                    buffer = ""
-                    return
-
                 if "</solution>" in buffer:
+
                     final_text = buffer.split("</solution>", 1)[0]
                     if final_text:
                         thinking_display.stream_token(final_text)
-
-                    if hasattr(thinking_display, '_tool_results') and thinking_display._tool_results:
-                        tool_results_text = ''.join(thinking_display._tool_results)
-                        if tool_results_text.strip():
-                            thinking_display.stream_token(tool_results_text)
-
                     in_solution = False
                     buffer = ""
+                    # Don't stream the closing tag
                 else:
-                    # Hold buffer if it might contain a partial opening/closing tag
-                    partial_tags = [
-                        '<', '</', '</s', '</so', '</sol', '</solu', '</solut', '</soluti', '</solutio', '</solution',
-                        '<r', '<re', '<rea', '<read', '<read_', '<read_f', '<read_fi', '<read_fil', '<read_file',
-                        '<c', '<cr', '<cre', '<crea', '<creat', '<create', '<create_', '<create_f', '<create_fi', '<create_fil', '<create_file',
-                        '<e', '<ed', '<edi', '<edit', '<edit_', '<edit_f', '<edit_fi', '<edit_fil', '<edit_file',
-                        '<l', '<li', '<lis', '<list', '<list_', '<list_f', '<list_fi', '<list_fil', '<list_file', '<list_files',
-                        '<w', '<wr', '<wri', '<writ', '<write', '<write_', '<write_f', '<write_fi', '<write_fil', '<write_file',
-                    ]
+                    partial_tags = ['<', '</', '</s', '</so', '</sol', '</solu', '</solut', '</soluti', '</solutio', '</solution']
                     if not any(buffer.endswith(p) for p in partial_tags):
                         if buffer:
                             thinking_display.stream_token(buffer)
                         buffer = ""
             elif not seen_first_tag:
-                # Discard all text before first tag - it's preamble/reasoning that shouldn't leak
-                buffer = ""
-                return
+
+                pass
 
             # Always filter out closing tags even if we're not in the corresponding mode
             # This handles cases where model generates closing tags without opening tags
@@ -559,15 +489,14 @@ Tool call format:
 <create_file><path>filepath</path><content>content</content></create_file>
 <edit_file><path>filepath</path><old>old text</old><new>new text</new></edit_file>
 <list_files>directory</list_files>
-Response format: <reasoning>plan</reasoning><solution>tool calls + brief progress notes + result</solution>
-IMPORTANT: Between tool calls, add brief progress notes like "Analyzing structure...", "Understanding architecture...", "Checking components..."."""
+Response format: <reasoning>plan</reasoning><solution>tool calls + result</solution>"""
     elif mode == "DATA":
         system_prompt = """Tools: read_file, list_files.
 Tool call format:
 <read_file>filepath</read_file>
 <list_files>directory</list_files>
-Execute tool and return ONLY raw output. NO commentary, NO interpretation.
-Response format: <solution>tool call</solution>"""
+Execute tool call and return ONLY the raw result. NO interpretation, NO analysis, NO explanations.
+Response format: <reasoning>brief plan</reasoning><solution>tool calls</solution>"""
     elif mode == "SYNTHESIS":
         system_prompt = "Output ONLY code in specified format. No explanations."
     elif mode == "ADAPTIVE":
@@ -576,8 +505,7 @@ Tool call format:
 <read_file>filepath</read_file>
 <create_file><path>filepath</path><content>content</content></create_file>
 <edit_file><path>filepath</path><old>old text</old><new>new text</new></edit_file>
-Response format: <solution>tool calls ONLY, NO reasoning text</solution>
-CRITICAL: Do NOT write reasoning or explanations. ONLY tool calls. Analysis will be generated separately."""
+Response format: <delta_reasoning>changes</delta_reasoning><solution>answer</solution>"""
     elif mode == "REACTIVE":
         system_prompt = "Apply rule. Format: <rule_activation>name</rule_activation><solution>answer</solution>"
     else:
@@ -642,14 +570,8 @@ CRITICAL: Do NOT write reasoning or explanations. ONLY tool calls. Analysis will
 
                 solution = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', solution, flags=re.DOTALL).strip()
             else:
-                # No tags found - check if there's text before <solution>
-                # Remove everything before <solution> tag if it exists
-                if '<solution>' in content:
-                    solution = content.split('<solution>', 1)[1].strip()
-                    if '</solution>' in solution:
-                        solution = solution.split('</solution>', 1)[0].strip()
-                else:
-                    solution = content.strip()
+
+                solution = content.strip()
 
                 solution = re.sub(r'<reasoning>.*?</reasoning>', '', solution, flags=re.DOTALL).strip()
                 solution = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', solution, flags=re.DOTALL).strip()

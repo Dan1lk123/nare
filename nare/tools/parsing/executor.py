@@ -217,12 +217,7 @@ def execute_tool_call(tool_name: str, args: List[str], stream_callback: Optional
             start_line = int(args[1]) if len(args) > 1 else None
             end_line = int(args[2]) if len(args) > 2 else None
             content = read_file(filepath, start_line, end_line)
-
-            # Show more content for read operations (up to 3000 chars)
-            if len(content) > 3000:
-                return f"Read {filepath} ({len(content)} chars, showing first 3000):\n```\n{content[:3000]}\n...\n```"
-            else:
-                return f"Read {filepath}:\n```\n{content}\n```"
+            return f"Read {filepath}:\n{content[:500]}..."
 
         elif tool_name == "list_files":
             directory = args[0] if len(args) > 0 else "."
@@ -272,11 +267,11 @@ class ToolExecutor:
         self.working_dir = working_dir
         self.logger = logging.getLogger("nare.tools.parsing.executor")
 
-    def parse_and_execute(self, response: str) -> Tuple[str, List[str], List[str]]:
+    def parse_and_execute(self, response: str) -> Tuple[str, List[str]]:
         """Parse tool calls from response and execute actions.
 
         Returns:
-            Tuple of (cleaned_response, list of modified files, list of tool results)
+            Tuple of (cleaned_response, list of modified files)
         """
         tool_calls = parse_tool_calls(response)
         results = []
@@ -290,4 +285,4 @@ class ToolExecutor:
                     modified_files.append(call['args'][0])
 
         cleaned = clean_tool_calls_from_text(response)
-        return cleaned.strip(), modified_files, results
+        return cleaned.strip(), modified_files
