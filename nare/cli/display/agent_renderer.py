@@ -342,7 +342,9 @@ def _verb_for(name: str) -> str:
 def _format_target(name: str, args: dict) -> str:
     """Pick the best single-line representation of the tool call args."""
     if name in ("read_file", "write_file", "edit_file"):
-        return str(args.get("path", ""))
+        # Handle both formats: {'path': 'x'} and {'tool': 'read_file', 'path': 'x'}
+        path = args.get("path") or args.get("filepath", "")
+        return str(path) if path else ""
     if name == "bash":
         return str(args.get("command", ""))
     if name == "grep":
@@ -355,4 +357,6 @@ def _format_target(name: str, args: dict) -> str:
         return str(args.get("glob", ""))
     if name == "git_status":
         return ""
-    return ", ".join(f"{k}={v!r}" for k, v in args.items())
+    # Filter out 'tool' and 'name' keys from display
+    filtered = {k: v for k, v in args.items() if k not in ('tool', 'name')}
+    return ", ".join(f"{k}={v!r}" for k, v in filtered.items())

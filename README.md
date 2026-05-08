@@ -266,7 +266,7 @@ asyncio.run(main())
 
 ```bash
 # Clone repo
-git clone https://github.com/yourusername/nare.git
+git clone https://github.com/Nare-Labs/NARE-CLI
 cd nare
 
 # Install in dev mode
@@ -323,8 +323,8 @@ Apache License 2.0 - see [LICENSE](LICENSE)
 
 ## Contact
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/nare/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/nare/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Nare-Labs/NARE-CLI/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Nare-Labs/NARE-CLI/discussions)
 
 ---
 

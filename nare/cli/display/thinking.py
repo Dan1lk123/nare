@@ -1,10 +1,11 @@
 """
-Real-time thinking display — premium streaming UI.
+Real-time thinking display with Claude Code-style streaming UI.
 
-Shows LLM reasoning in gray, solution in white, with beautiful
-animated transitions between phases. Thread-safe and flicker-free.
+Shows thinking phase with elapsed timer, then smoothly transitions
+to solution streaming. Clean, fast, professional.
 """
 
+import re
 import time
 import math
 from contextlib import contextmanager
@@ -12,22 +13,39 @@ from rich.text import Text
 from . import ui
 from .spinner import WaitingSpinner
 
+_XML_TAGS = (
+    '<solution>', '</solution>', '<reasoning>', '</reasoning>',
+    '<abstract_signature>', '</abstract_signature>',
+    '<delta_reasoning>', '</delta_reasoning>',
+    '<tool_call>', '</tool_call>',
+)
+
+_TOOL_OPEN_TAGS = (
+    '<read_file>', '<edit_file>', '<write_file>',
+    '<bash_command>', '<tool_call>', '<create_file>',
+    '<list_files>',
+)
+
+_TOOL_CLOSE_TAGS = (
+    '</read_file>', '</edit_file>', '</write_file>',
+    '</bash_command>', '</tool_call>', '</create_file>',
+    '</list_files>',
+)
+
+
+def _strip_xml_tags(text: str) -> str:
+    cleaned = re.sub(r'</?(?:solution|reasoning|abstract_signature|delta_reasoning|tool_call)\s*>', '', text)
+    cleaned = re.sub(r'\{\s*"name"\s*:\s*"\w+"\s*,\s*"args"\s*:\s*\{[^}]*\}\s*\}', '', cleaned)
+    return cleaned.strip()
+
+
 class ThinkingDisplay:
-    """Manages real-time display of LLM reasoning and solution tokens.
-    
-    Phases:
-    1. THINKING — gray text, reasoning tokens stream
-    2. SOLUTION — white text, final answer streams
-    
-    Transitions between phases are animated with color shifts.
-    """
 
     def __init__(self, session=None):
         self.live = None
         self.buffer = ""
         self.mode = "thinking"
         self.solution_lines_printed = 0
-        self.max_solution_lines = 50
         self.in_code_block = False
         self.code_block_lines = 0
         self.start_time = time.time()
@@ -39,56 +57,80 @@ class ThinkingDisplay:
         self.in_xml_tag = False
         self.xml_buffer = ""
         self.thinking_lines = []
-        self.keep_last_n_lines = 15
+        self.thinking_token_count = 0
+        self.solution_started = False
+        self.route_shown = False
+        self.current_route = None
         self.session = session
 
     def _stop_live_and_spinner(self):
-        """Helper to stop any running spinners/live displays before printing."""
         if self.waiting_spinner:
             self.waiting_spinner.stop()
             self.waiting_spinner = None
 
-    def switch_to_solution(self):
-        """Switch from thinking mode to solution streaming mode."""
+    def _elapsed_str(self) -> str:
+        elapsed = time.time() - self.start_time
+        if elapsed < 60:
+            return f"{elapsed:.1f}s"
+        return f"{int(elapsed // 60)}m{int(elapsed % 60)}s"
+
+    def _print_transition(self):
+        if self.thinking_token_count > 0:
+            elapsed = self._elapsed_str()
+            ui.console.print()
+            ui.console.print(
+                f"  [#444444]\u2500[/] [#555555]thought for {elapsed}[/]",
+            )
+            ui.console.print()
+
+    def show_route(self, route: str):
+        from .blocks import ROUTE_PALETTE
+        self.current_route = route
+        color = ROUTE_PALETTE.get(route, "#999999")
         self._stop_live_and_spinner()
+        ui.console.print(
+            Text.assemble(
+                ("  ", ""),
+                ("\u25c6 ", f"bold {color}"),
+                (route, f"bold {color}"),
+            )
+        )
+        self.route_shown = True
+
+    def switch_to_solution(self):
+        self._stop_live_and_spinner()
+        if self.mode == "thinking":
+            self._print_transition()
         self.mode = "solution"
         self.solution_lines_printed = 0
         self.in_code_block = False
         self.code_block_lines = 0
+        self.solution_started = True
 
     def stream_token(self, token: str):
-        """Stream a single token from LLM output.
-
-        Modes:
-        - thinking: Gray text, reasoning process
-        - solution: White text, final answer
-        """
-
         self._stop_live_and_spinner()
 
-        if token.strip() in ['</solution>', '</reasoning>', '</abstract_signature>', '</delta_reasoning>']:
+        stripped = token.strip()
+        if stripped in _XML_TAGS or any(stripped == tag for tag in _XML_TAGS):
+            return
+        if re.search(r'^</?(?:solution|reasoning|abstract_signature|delta_reasoning|tool_call)\s*>$', stripped):
             return
 
         if self.mode == "thinking":
-            # Accumulate tokens into buffer, split by newlines
-            self.buffer += token
-            if '\n' in token:
-                lines = self.buffer.split('\n')
-                self.thinking_lines.extend(lines[:-1])
-                self.buffer = lines[-1]
-            ui.console.print(token, style="#666666", end="")
+            self.thinking_lines.append(token)
+            self.thinking_token_count += 1
+            ui.console.print(token, style="#555555", end="")
             return
 
         if self.mode == "solution":
-            if '<read_file>' in token or '<edit_file>' in token or '<write_file>' in token or '<bash_command>' in token:
+            if any(tag in token for tag in _TOOL_OPEN_TAGS):
                 self.in_xml_tag = True
                 self.xml_buffer = token
                 return
 
             if self.in_xml_tag:
                 self.xml_buffer += token
-
-                if '</read_file>' in self.xml_buffer or '</edit_file>' in self.xml_buffer or '</write_file>' in self.xml_buffer or '</bash_command>' in self.xml_buffer:
+                if any(tag in self.xml_buffer for tag in _TOOL_CLOSE_TAGS):
                     self.in_xml_tag = False
                     self.xml_buffer = ""
                 return
@@ -109,106 +151,46 @@ class ThinkingDisplay:
 
             if self.in_code_block and self.code_block_lines > 200:
                 if self.code_block_lines == 201:
-                    ui.console.print("\n[dim]  ⋯ (long code truncated)[/dim]", style="#555555")
+                    ui.console.print("\n[dim]  ... (truncated)[/dim]", style="#555555")
                     ui.console.file.flush()
                 return
 
             if self.solution_lines_printed > 200:
                 if self.solution_lines_printed == 201:
-                    ui.console.print("\n[dim]  ⋯ (output truncated)[/dim]", style="#555555")
+                    ui.console.print("\n[dim]  ... (truncated)[/dim]", style="#555555")
                     ui.console.file.flush()
                 return
 
             ui.console.print(token, end='', style="white")
             ui.console.file.flush()
         else:
-
             self.buffer += token
-
             if '\n' in token:
-                lines = (self.buffer).split('\n')
+                lines = self.buffer.split('\n')
                 self.thinking_lines.extend(lines[:-1])
                 self.buffer = lines[-1]
-
-            ui.console.print(token, end='', style="#666666")
+            ui.console.print(token, end='', style="#555555")
             ui.console.file.flush()
 
     def print_action(self, action: str):
-        """Print an action label with animated dot."""
         self._stop_live_and_spinner()
-
-        elapsed = time.time() - self.start_time
-
-        phase = (math.sin(elapsed * 2.0) + 1.0) / 2.0
-        r = int(180 + 75 * phase)
-        g = int(100 + 55 * phase)
-        b = int(60 + 40 * phase)
-        dot_color = f"#{r:02x}{g:02x}{b:02x}"
-
-        ui.console.print(f"  [{dot_color}]●[/] [{dot_color}]{action}[/]")
+        ui.console.print(f"  [#D77757]>[/] [#999999]{action}[/]")
 
     def start_waiting(self, message: str = "Thinking"):
-        """Start smooth waiting animation.
-
-        Shows spinner with message during long operations (routing, model loading).
-        """
         self._stop_live_and_spinner()
         self.waiting_spinner = WaitingSpinner(message, delay=0.08, color="#D77757")
         self.waiting_spinner.start()
 
     def update_waiting(self, message: str):
-        """Update the message of the currently running waiting spinner."""
         if self.waiting_spinner:
             self.waiting_spinner.text = message
         else:
             self.start_waiting(message)
 
     def stop_waiting(self):
-        """Stop waiting animation."""
         self._stop_live_and_spinner()
 
     def update_progress(self, current: int, total: int, message: str = ""):
-        """Update progress indicator.
-
-        Args:
-            current: Current step
-            total: Total steps
-            message: Progress message
-        """
-        self._stop_live_and_spinner()
-
-        self.progress_current = current
-        self.progress_total = total
-        self.progress_message = message
-
-        if self.mode == "solution":
-            return
-
-        percent = int((current / total) * 100) if total > 0 else 0
-        bar_length = 20
-        filled = int((current / total) * bar_length) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_length - filled)
-
-        elapsed = time.time() - self.start_time
-        phase = (math.sin(elapsed * 2.0) + 1.0) / 2.0
-        r = int(180 + 75 * phase)
-        g = int(100 + 55 * phase)
-        b = int(60 + 40 * phase)
-        color = f"#{r:02x}{g:02x}{b:02x}"
-
-        ui.console.print(
-            f"  [{color}]▸[/] [#999999]{message} [{bar}] {percent}% ({current}/{total})[/]"
-        )
-        ui.console.file.flush()
-
-    def update_progress(self, current: int, total: int, message: str = ""):
-        """Update progress indicator.
-
-        Args:
-            current: Current step
-            total: Total steps
-            message: Progress message
-        """
         self.progress_current = current
         self.progress_total = total
         self.progress_message = message
@@ -221,8 +203,7 @@ class ThinkingDisplay:
         percent = int((current / total) * 100) if total > 0 else 0
         bar_length = 24
         filled = int((current / total) * bar_length) if total > 0 else 0
-
-        bar = "█" * filled + "░" * (bar_length - filled)
+        bar = "=" * filled + "-" * (bar_length - filled)
 
         elapsed = time.time() - self.start_time
         phase = (math.sin(elapsed * 2.0) + 1.0) / 2.0
@@ -232,16 +213,14 @@ class ThinkingDisplay:
         bar_color = f"#{r:02x}{g:02x}{b:02x}"
 
         ui.console.print(
-            f"  [{bar_color}]▸[/] [#888888]{message} [{bar_color}]{bar}[/{bar_color}] {percent}% ({current}/{total})[/]"
+            f"  [{bar_color}]>[/] [#888888]{message} [{bar_color}][{bar}][/{bar_color}] {percent}%[/]"
         )
 
     def _update(self):
-        """Update the live display."""
         pass
 
     @contextmanager
     def show(self):
-        """Context manager for live display."""
         self.buffer = ""
         self.mode = "thinking"
         self.solution_lines_printed = 0
@@ -250,35 +229,27 @@ class ThinkingDisplay:
         self.start_time = time.time()
         self.frame_idx = 0
         self.thinking_lines = []
+        self.thinking_token_count = 0
+        self.solution_started = False
+        self.route_shown = False
 
         try:
             yield self
         finally:
             self._stop_live_and_spinner()
-
-            if self.thinking_lines and self.mode == "thinking":
-
+            if not self.solution_started and self.thinking_token_count > 0:
                 ui.console.print()
 
-                ui.console.print("  [#444444]─── Key reasoning steps ───[/]")
-
-                last_lines = self.thinking_lines[-self.keep_last_n_lines:]
-                for line in last_lines:
-                    if line.strip():
-                        ui.console.print(f"  [#666666]{line}[/]")
-
-                ui.console.print("  [#444444]───────────────────────────[/]")
-                ui.console.print()
 
 _thinking = ThinkingDisplay()
 
+
 def get_thinking_display() -> ThinkingDisplay:
-    """Get the global thinking display."""
     return _thinking
+
 
 @contextmanager
 def show_thinking(session=None):
-    """Show thinking display for a block of code."""
     display = ThinkingDisplay(session=session)
     with display.show():
         yield display

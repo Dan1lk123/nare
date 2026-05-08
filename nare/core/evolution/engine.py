@@ -178,6 +178,11 @@ class EvolutionEngine:
         else:
             logging.warning("[LIBRARY LEARNING] Failed to discover generalizing rule.")
 
+        # Save compiled skills to disk
+        if self.memory.compiled_skills:
+            logging.info("[LIBRARY LEARNING] Saving compiled skills to disk")
+            self.memory.force_save()
+
     def _validate_skills(self):
         """Validate existing skills through stress testing.
 
