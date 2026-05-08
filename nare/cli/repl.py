@@ -1,4 +1,3 @@
-"""REPL - Interactive Read-Eval-Print Loop for NARE CLI."""
 
 import os
 import re
@@ -158,7 +157,7 @@ def run_query(session: NareSession, query: str):
                         added_files.append(word)
 
     if added_files:
-        console.print(f"[#666666]Context:[/] [#00FFFF]{', '.join(added_files)}[/]")
+        console.print(f"[#666666]Context:[/] [#999999]{', '.join(added_files)}[/]")
         console.print()
 
         file_contents = []
