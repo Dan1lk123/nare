@@ -1,10 +1,3 @@
-"""
-Real-time thinking display with Claude Code-style streaming UI.
-
-Shows thinking phase with elapsed timer, then smoothly transitions
-to solution streaming. Clean, fast, professional.
-"""
-
 import re
 import time
 import math
