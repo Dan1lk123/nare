@@ -275,12 +275,30 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
         in_solution = False
         in_abstract = False
         in_tool_call = False
+        in_xml_tool = False
+        xml_tool_name = ""
+        xml_tool_buffer = ""
         buffer = ""
         seen_first_tag = False
         tool_call_buffer = ""
 
+        _XML_TOOL_TAGS = ('read_file', 'create_file', 'edit_file', 'list_files', 'write_file')
+
+        def _execute_xml_tool(tool_tag: str, content: str):
+            """Execute an XML-style tool call and return result."""
+            try:
+                from nare.tools.parsing.executor import parse_tool_calls, execute_tool_call
+                fake_xml = f'<{tool_tag}>{content}</{tool_tag}>'
+                calls = parse_tool_calls(fake_xml)
+                if calls:
+                    result = execute_tool_call(calls[0]['tool'], calls[0]['args'], working_dir='.')
+                    return result
+            except Exception as e:
+                logging.warning(f'[XML_TOOL] Failed to execute {tool_tag}: {e}')
+            return None
+
         def callback(token: str):
-            nonlocal in_reasoning, in_delta, in_solution, in_abstract, in_tool_call, buffer, seen_first_tag, tool_call_buffer
+            nonlocal in_reasoning, in_delta, in_solution, in_abstract, in_tool_call, in_xml_tool, xml_tool_name, xml_tool_buffer, buffer, seen_first_tag, tool_call_buffer
             buffer += token
 
             # ALWAYS filter out <tool_call> blocks first (with whitespace handling)
@@ -455,13 +473,49 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                     # Discard all delta_reasoning content - don't stream it
                     buffer = ""
             elif in_solution:
-                if "</solution>" in buffer:
+                # Handle XML tool call accumulation
+                if in_xml_tool:
+                    xml_tool_buffer += buffer
+                    buffer = ""
+                    close_tag = f'</{xml_tool_name}>'
+                    if close_tag in xml_tool_buffer:
+                        content = xml_tool_buffer.split(close_tag, 1)[0]
+                        remainder = xml_tool_buffer.split(close_tag, 1)[1]
+                        in_xml_tool = False
 
+                        result = _execute_xml_tool(xml_tool_name, content)
+                        xml_tool_name = ""
+                        xml_tool_buffer = ""
+
+                        if result:
+                            thinking_display.stream_token(f"\n{result}\n")
+                            if hasattr(thinking_display, '_tool_results'):
+                                thinking_display._tool_results.append(f"\n{result}")
+                            else:
+                                thinking_display._tool_results = [f"\n{result}"]
+
+                        if remainder.strip():
+                            buffer = remainder
+                    return
+
+                # Check for XML tool call opening tags in buffer
+                import re as _re
+                xml_tool_match = _re.search(r'<(' + '|'.join(_XML_TOOL_TAGS) + r')>', buffer)
+                if xml_tool_match:
+                    before = buffer[:xml_tool_match.start()]
+                    if before.strip():
+                        thinking_display.stream_token(before)
+                    in_xml_tool = True
+                    xml_tool_name = xml_tool_match.group(1)
+                    xml_tool_buffer = buffer[xml_tool_match.end():]
+                    buffer = ""
+                    return
+
+                if "</solution>" in buffer:
                     final_text = buffer.split("</solution>", 1)[0]
                     if final_text:
                         thinking_display.stream_token(final_text)
 
-                    # Stream tool results immediately after solution closes
                     if hasattr(thinking_display, '_tool_results') and thinking_display._tool_results:
                         tool_results_text = ''.join(thinking_display._tool_results)
                         if tool_results_text.strip():
@@ -469,9 +523,16 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
                     in_solution = False
                     buffer = ""
-                    # Don't stream the closing tag
                 else:
-                    partial_tags = ['<', '</', '</s', '</so', '</sol', '</solu', '</solut', '</soluti', '</solutio', '</solution']
+                    # Hold buffer if it might contain a partial opening/closing tag
+                    partial_tags = [
+                        '<', '</', '</s', '</so', '</sol', '</solu', '</solut', '</soluti', '</solutio', '</solution',
+                        '<r', '<re', '<rea', '<read', '<read_', '<read_f', '<read_fi', '<read_fil', '<read_file',
+                        '<c', '<cr', '<cre', '<crea', '<creat', '<create', '<create_', '<create_f', '<create_fi', '<create_fil', '<create_file',
+                        '<e', '<ed', '<edi', '<edit', '<edit_', '<edit_f', '<edit_fi', '<edit_fil', '<edit_file',
+                        '<l', '<li', '<lis', '<list', '<list_', '<list_f', '<list_fi', '<list_fil', '<list_file', '<list_files',
+                        '<w', '<wr', '<wri', '<writ', '<write', '<write_', '<write_f', '<write_fi', '<write_fil', '<write_file',
+                    ]
                     if not any(buffer.endswith(p) for p in partial_tags):
                         if buffer:
                             thinking_display.stream_token(buffer)
