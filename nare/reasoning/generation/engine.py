@@ -435,16 +435,13 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
             if "<reasoning>" in buffer and not in_reasoning:
                 in_reasoning = True
                 seen_first_tag = True
-
                 buffer = buffer.split("<reasoning>", 1)[1]
-                # Don't stream reasoning - it's internal thinking that shouldn't leak
                 return
 
             if "<delta_reasoning>" in buffer and not in_delta:
                 in_delta = True
                 seen_first_tag = True
                 buffer = buffer.split("<delta_reasoning>", 1)[1]
-                # Don't stream delta_reasoning - it's internal reasoning that shouldn't leak
                 return
 
             if "<solution>" in buffer and not in_solution:
@@ -458,19 +455,23 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
             if in_reasoning:
                 if "</reasoning>" in buffer:
-                    # Don't stream reasoning content - it's internal
+                    before = buffer.split("</reasoning>", 1)[0]
+                    if before.strip():
+                        thinking_display.stream_token(before)
                     in_reasoning = False
                     buffer = ""
                 else:
-                    # Discard all reasoning content - don't stream it
+                    thinking_display.stream_token(buffer)
                     buffer = ""
             elif in_delta:
                 if "</delta_reasoning>" in buffer:
-                    # Don't stream the final text - delta_reasoning is internal
+                    before = buffer.split("</delta_reasoning>", 1)[0]
+                    if before.strip():
+                        thinking_display.stream_token(before)
                     in_delta = False
                     buffer = ""
                 else:
-                    # Discard all delta_reasoning content - don't stream it
+                    thinking_display.stream_token(buffer)
                     buffer = ""
             elif in_solution:
                 # Handle XML tool call accumulation
