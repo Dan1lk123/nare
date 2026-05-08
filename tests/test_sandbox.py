@@ -8,7 +8,7 @@ catch.
 
 import pytest
 
-from nare.execution.sandboxes.base import (
+from nare.sandbox import (
     SecurityError,
     safe_call_trigger,
     safe_execute,

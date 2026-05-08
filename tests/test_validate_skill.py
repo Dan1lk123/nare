@@ -23,7 +23,7 @@ from dataclasses import replace
 import pytest
 
 from nare.config import DEFAULT_CONFIG, SkillValidationConfig
-from nare.reasoning.generation.engine import _validate_skill
+from nare.llm import _validate_skill
 from nare.oracle import (
     build_oracle_from_spec,
     numeric_set_oracle,

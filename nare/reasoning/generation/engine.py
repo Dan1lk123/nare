@@ -379,7 +379,16 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                                 display_verb=None
                             ))
 
-                            # Append tool result to solution so it appears in final answer
+                            # Stream tool result immediately so it appears in real-time
+                            if thinking_display:
+                                # Ensure we're in solution mode before streaming results
+                                if hasattr(thinking_display, 'mode') and thinking_display.mode != 'solution':
+                                    if hasattr(thinking_display, 'switch_to_solution'):
+                                        thinking_display.switch_to_solution()
+
+                                thinking_display.stream_token(f"\n{result_msg}\n")
+
+                            # Also append to _tool_results for final answer assembly
                             if hasattr(thinking_display, '_tool_results'):
                                 thinking_display._tool_results.append(f"\n{result_msg}")
                             else:
@@ -390,7 +399,7 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                         logging.warning(traceback.format_exc())
                     return
 
-            if mode in ("DIRECT", "SYNTHESIS", "DATA"):
+            if mode in ("DIRECT", "SYNTHESIS"):
                 thinking_display.stream_token(token)
                 return
 
@@ -410,12 +419,14 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                 seen_first_tag = True
 
                 buffer = buffer.split("<reasoning>", 1)[1]
+                # Don't stream reasoning - it's internal thinking that shouldn't leak
                 return
 
             if "<delta_reasoning>" in buffer and not in_delta:
                 in_delta = True
                 seen_first_tag = True
                 buffer = buffer.split("<delta_reasoning>", 1)[1]
+                # Don't stream delta_reasoning - it's internal reasoning that shouldn't leak
                 return
 
             if "<solution>" in buffer and not in_solution:
@@ -429,37 +440,33 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
             if in_reasoning:
                 if "</reasoning>" in buffer:
-
-                    final_text = buffer.split("</reasoning>", 1)[0]
-                    if final_text:
-                        thinking_display.stream_token(final_text)
+                    # Don't stream reasoning content - it's internal
                     in_reasoning = False
                     buffer = ""
                 else:
-                    partial_tags = ['<', '</', '</r', '</re', '</rea', '</reas', '</reaso', '</reason', '</reasoni', '</reasonin']
-                    if not any(buffer.endswith(p) for p in partial_tags):
-                        if buffer:
-                            thinking_display.stream_token(buffer)
-                        buffer = ""
+                    # Discard all reasoning content - don't stream it
+                    buffer = ""
             elif in_delta:
                 if "</delta_reasoning>" in buffer:
-                    final_text = buffer.split("</delta_reasoning>", 1)[0]
-                    if final_text:
-                        thinking_display.stream_token(final_text)
+                    # Don't stream the final text - delta_reasoning is internal
                     in_delta = False
                     buffer = ""
                 else:
-                    partial_tags = ['<', '</', '</d', '</de', '</del', '</delt', '</delta', '</delta_', '</delta_r', '</delta_re', '</delta_rea', '</delta_reas', '</delta_reaso', '</delta_reason', '</delta_reasoni', '</delta_reasonin', '</delta_reasoning']
-                    if not any(buffer.endswith(p) for p in partial_tags):
-                        if buffer:
-                            thinking_display.stream_token(buffer)
-                        buffer = ""
+                    # Discard all delta_reasoning content - don't stream it
+                    buffer = ""
             elif in_solution:
                 if "</solution>" in buffer:
 
                     final_text = buffer.split("</solution>", 1)[0]
                     if final_text:
                         thinking_display.stream_token(final_text)
+
+                    # Stream tool results immediately after solution closes
+                    if hasattr(thinking_display, '_tool_results') and thinking_display._tool_results:
+                        tool_results_text = ''.join(thinking_display._tool_results)
+                        if tool_results_text.strip():
+                            thinking_display.stream_token(tool_results_text)
+
                     in_solution = False
                     buffer = ""
                     # Don't stream the closing tag
@@ -470,8 +477,9 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                             thinking_display.stream_token(buffer)
                         buffer = ""
             elif not seen_first_tag:
-
-                pass
+                # Discard all text before first tag - it's preamble/reasoning that shouldn't leak
+                buffer = ""
+                return
 
             # Always filter out closing tags even if we're not in the corresponding mode
             # This handles cases where model generates closing tags without opening tags
@@ -484,15 +492,30 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
     if mode == "ANALYTIC":
         system_prompt = """Tools: create_file, edit_file, read_file, list_files.
-Format: <reasoning>plan</reasoning><solution>tool calls + result</solution>"""
+Tool call format:
+<read_file>filepath</read_file>
+<create_file><path>filepath</path><content>content</content></create_file>
+<edit_file><path>filepath</path><old>old text</old><new>new text</new></edit_file>
+<list_files>directory</list_files>
+Response format: <reasoning>plan</reasoning><solution>tool calls + brief progress notes + result</solution>
+IMPORTANT: Between tool calls, add brief progress notes like "Analyzing structure...", "Understanding architecture...", "Checking components..."."""
     elif mode == "DATA":
         system_prompt = """Tools: read_file, list_files.
-Execute tool call and return ONLY the raw result. NO interpretation, NO analysis, NO explanations.
-Format: <solution>tool call</solution>"""
+Tool call format:
+<read_file>filepath</read_file>
+<list_files>directory</list_files>
+Execute tool and return ONLY raw output. NO commentary, NO interpretation.
+Response format: <solution>tool call</solution>"""
     elif mode == "SYNTHESIS":
         system_prompt = "Output ONLY code in specified format. No explanations."
     elif mode == "ADAPTIVE":
-        system_prompt = "Adapt previous solution. Format: <delta_reasoning>changes</delta_reasoning><solution>answer</solution>"
+        system_prompt = """Adapt previous solution.
+Tool call format:
+<read_file>filepath</read_file>
+<create_file><path>filepath</path><content>content</content></create_file>
+<edit_file><path>filepath</path><old>old text</old><new>new text</new></edit_file>
+Response format: <solution>tool calls ONLY, NO reasoning text</solution>
+CRITICAL: Do NOT write reasoning or explanations. ONLY tool calls. Analysis will be generated separately."""
     elif mode == "REACTIVE":
         system_prompt = "Apply rule. Format: <rule_activation>name</rule_activation><solution>answer</solution>"
     else:
@@ -557,8 +580,14 @@ Format: <solution>tool call</solution>"""
 
                 solution = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', solution, flags=re.DOTALL).strip()
             else:
-
-                solution = content.strip()
+                # No tags found - check if there's text before <solution>
+                # Remove everything before <solution> tag if it exists
+                if '<solution>' in content:
+                    solution = content.split('<solution>', 1)[1].strip()
+                    if '</solution>' in solution:
+                        solution = solution.split('</solution>', 1)[0].strip()
+                else:
+                    solution = content.strip()
 
                 solution = re.sub(r'<reasoning>.*?</reasoning>', '', solution, flags=re.DOTALL).strip()
                 solution = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', solution, flags=re.DOTALL).strip()

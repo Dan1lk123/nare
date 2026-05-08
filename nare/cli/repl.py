@@ -264,9 +264,11 @@ def run_query(session: NareSession, query: str):
     answer = re.sub(r'<delta_reasoning>.*?</delta_reasoning>', '', answer, flags=re.DOTALL)
     answer = re.sub(r'</?solution>', '', answer)
     answer = re.sub(r'</?final_answer>', '', answer)
-    # Remove any remaining tags
+    answer = re.sub(
+        r'\{\s*"name"\s*:\s*"(?:create_file|edit_file|read_file|list_files|list_dir|write_file)"\s*,\s*"args"\s*:\s*\{[^}]*\}\s*\}',
+        '', answer
+    )
     answer = re.sub(r'<[^>]+>', '', answer)
-    # Clean up excessive newlines and leading/trailing whitespace
     answer = re.sub(r'\n{3,}', '\n\n', answer).strip()
 
     route = result.get("route_decision", "FAST")
@@ -314,6 +316,24 @@ def run_query(session: NareSession, query: str):
         session._start_time = session_start
 
     if route != "AGENT":
+        # Show tokens line before status bar (like in agent loop)
+        if total_tokens > 0:
+            from rich.text import Text
+            from nare.cli.display import blocks
+
+            if total_tokens >= 1000:
+                token_str = f"{total_tokens / 1000:.1f}k".replace(".0k", "k")
+            else:
+                token_str = str(total_tokens)
+
+            token_line = Text()
+            token_line.append("  ● ", style=blocks.ACCENT)
+            token_line.append(token_str + " tokens", style=blocks.TEXT_MUTED)
+            token_line.append("  ·  ", style=blocks.TEXT_FAINT)
+            token_line.append(f"{elapsed:.1f}s", style=blocks.TEXT)
+            console.print(token_line)
+            console.print()
+
         info = session.get_status()
         StatusBar.render(
             console, route, elapsed, tokens_in, tokens_out,
