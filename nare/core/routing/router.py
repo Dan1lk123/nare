@@ -1160,7 +1160,7 @@ Answer with just "ACTION" or "CONVERSATION"."""
                 "messages": [{"role": "user", "content": prompt}]
             })
 
-            result = response.get("content", [{}])[0].get("text", "").strip().upper()
+            result = response.strip().upper() if isinstance(response, str) else ""
 
             if "ACTION" in result:
                 return "EDIT"
@@ -1194,10 +1194,6 @@ Answer with just "ACTION" or "CONVERSATION"."""
         for task in simple_tasks:
             if query_lower.startswith(task):
                 return False
-
-        return False
-        if len(query_lower) > 50:
-            return True
 
         return False
 

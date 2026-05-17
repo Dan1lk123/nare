@@ -884,6 +884,152 @@ class AutonomyCommand(Command):
             ui.print_error(f"Invalid autonomy level: {level_name}")
             ui.console.print("  [#666666]Valid levels: supervised, assisted, autonomous[/]")
 
+class SetupCommand(Command):
+    name = "setup"
+    aliases = ["configure", "init"]
+    help = "Interactive setup wizard for NARE reasoning provider"
+
+    def execute(self, session: NareSession, arg: str):
+        from rich.panel import Panel
+        from rich.prompt import Prompt, IntPrompt
+
+        ui.console.print()
+        ui.console.print(Panel(
+            "[bold #D77757]NARE Setup Wizard[/]\n\n"
+            "Configure the reasoning provider for NARE CLI.",
+            border_style="#444444",
+            padding=(1, 2),
+        ))
+
+        ui.console.print("  [bold #D77757]1[/]  [white]Cloud Provider API[/]  [#666666]— Anthropic / OpenAI / Google[/]")
+        ui.console.print("  [bold #D77757]2[/]  [white]Local Cortex-1[/]  [#666666]— 100% Free & Offline (requires CUDA)[/]")
+        ui.console.print("  [bold #D77757]3[/]  [white]Cortex Cloud API[/]  [#666666]— Managed SaaS (api.nare.ai)[/]")
+        ui.console.print()
+
+        choice = IntPrompt.ask("  [#999999]Select provider[/]", choices=["1", "2", "3"], default=1)
+
+        from nare.config.api_keys import get_api_key_manager
+        km = get_api_key_manager()
+
+        if choice == 1:
+            ui.console.print()
+            ui.console.print("  [bold #D77757]Cloud Provider API[/]")
+            ui.console.print("  [#666666]Select your LLM provider:[/]")
+            ui.console.print()
+            ui.console.print("  [bold #D77757]a[/]  Anthropic (Claude)")
+            ui.console.print("  [bold #D77757]b[/]  OpenAI (GPT)")
+            ui.console.print("  [bold #D77757]c[/]  Google (Gemini)")
+            ui.console.print()
+
+            provider = Prompt.ask("  [#999999]Provider[/]", choices=["a", "b", "c"], default="a")
+
+            provider_map = {
+                "a": ("anthropic", "ANTHROPIC_API_KEY"),
+                "b": ("openai", "OPENAI_API_KEY"),
+                "c": ("google", "GOOGLE_API_KEY"),
+            }
+            provider_name, env_key = provider_map[provider]
+
+            existing = os.environ.get(env_key, "")
+            if existing:
+                ui.console.print(f"  [#666666]Found {env_key} in environment[/]")
+                use_existing = Prompt.ask("  [#999999]Use existing key?[/]", choices=["y", "n"], default="y")
+                if use_existing == "y":
+                    km.set_key(provider_name, existing)
+                    ui.console.print(f"  [green]Configured {provider_name} provider[/]")
+                    return
+
+            api_key = Prompt.ask(f"  [#999999]Enter {env_key}[/]", password=True)
+            if api_key.strip():
+                km.set_key(provider_name, api_key.strip())
+                os.environ[env_key] = api_key.strip()
+                ui.console.print(f"  [green]Configured {provider_name} provider[/]")
+            else:
+                ui.console.print("  [red]No key provided, setup cancelled[/]")
+
+        elif choice == 2:
+            ui.console.print()
+            ui.console.print("  [bold #D77757]Local Cortex-1 (Offline)[/]")
+
+            cuda_available = False
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available()
+            except ImportError:
+                pass
+
+            if cuda_available:
+                ui.console.print("  [green]CUDA detected[/]")
+            else:
+                ui.console.print("  [yellow]CUDA not detected — CPU inference will be slower[/]")
+
+            endpoint = Prompt.ask(
+                "  [#999999]Local endpoint[/]",
+                default="http://localhost:8000"
+            )
+
+            km.set_key("local", "local-cortex-1")
+            import json
+            config_file = km.config_file
+            try:
+                config = {}
+                if config_file.exists():
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                config['provider'] = 'local'
+                config['local_endpoint'] = endpoint
+
+                import tempfile
+                fd, tmp = tempfile.mkstemp(dir=str(km.config_dir), suffix='.tmp')
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(config, f, indent=2)
+                os.replace(tmp, str(config_file))
+            except Exception:
+                pass
+
+            os.environ["ANTHROPIC_BASE_URL"] = endpoint
+            ui.console.print(f"  [green]Configured local Cortex-1 at {endpoint}[/]")
+
+        elif choice == 3:
+            ui.console.print()
+            ui.console.print("  [bold #D77757]Cortex Cloud API (SaaS)[/]")
+            ui.console.print("  [#666666]Connects to https://api.nare.ai[/]")
+            ui.console.print()
+
+            license_key = Prompt.ask("  [#999999]Enter your NARE License Key[/]", password=True)
+            if not license_key.strip():
+                ui.console.print("  [red]No license key provided, setup cancelled[/]")
+                return
+
+            license_key = license_key.strip()
+            km.set_key("nare_cloud", license_key)
+
+            import json
+            config_file = km.config_file
+            try:
+                config = {}
+                if config_file.exists():
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                config['provider'] = 'nare_cloud'
+                config['nare_api_key'] = license_key
+                config['nare_endpoint'] = 'https://api.nare.ai'
+
+                import tempfile
+                fd, tmp = tempfile.mkstemp(dir=str(km.config_dir), suffix='.tmp')
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(config, f, indent=2)
+                os.replace(tmp, str(config_file))
+            except Exception:
+                pass
+
+            os.environ["NARE_API_KEY"] = license_key
+            os.environ["ANTHROPIC_BASE_URL"] = "https://api.nare.ai"
+            ui.console.print("  [green]Configured Cortex Cloud API (api.nare.ai)[/]")
+
+        ui.console.print()
+
+
 COMMANDS: list[Command] = [
     HelpCommand(),
     AgentCommand(),
@@ -909,6 +1055,7 @@ COMMANDS: list[Command] = [
     TestCommand(),
     BenchCommand(),
     ResumeCommand(),
+    SetupCommand(),
     ExitCommand(),
 ]
 
