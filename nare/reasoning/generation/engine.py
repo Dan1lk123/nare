@@ -67,6 +67,10 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
         'anthropic-version': '2023-06-01'
     }
 
+    nare_license = os.getenv("NARE_API_KEY", "")
+    if nare_license:
+        headers['Authorization'] = f'Bearer {nare_license}'
+
     retries = 5
     for attempt in range(retries):
         req = urllib.request.Request(url, data=data, headers=headers)
@@ -74,29 +78,46 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
             with urllib.request.urlopen(req, timeout=120) as response:
 
                 if stream_callback:
-                    content_parts = []
+                    import codecs
                     import sys
+                    content_parts = []
+                    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+                    buffer = ""
 
                     while True:
-                        line = response.readline()
-                        if not line:
+                        chunk = response.read(4096)
+                        if not chunk:
                             break
+                        buffer += decoder.decode(chunk)
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line_str = line.strip()
+                            if line_str.startswith('data: '):
+                                try:
+                                    event_data = json.loads(line_str[6:])
+                                    if event_data.get('type') == 'content_block_delta':
+                                        delta = event_data.get('delta', {})
+                                        text = delta.get('text', '')
+                                        if text:
+                                            content_parts.append(text)
+                                            stream_callback(text)
+                                            sys.stdout.flush()
+                                except json.JSONDecodeError:
+                                    continue
 
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-
-                        if line_str.startswith('data: '):
-                            try:
-                                event_data = json.loads(line_str[6:])
-
-                                if event_data.get('type') == 'content_block_delta':
-                                    delta = event_data.get('delta', {})
-                                    text = delta.get('text', '')
-                                    if text:
-                                        content_parts.append(text)
-                                        stream_callback(text)
-                                        sys.stdout.flush()
-                            except json.JSONDecodeError:
-                                continue
+                    remaining = decoder.decode(b'', final=True)
+                    if remaining:
+                        buffer += remaining
+                    if buffer.strip().startswith('data: '):
+                        try:
+                            event_data = json.loads(buffer.strip()[6:])
+                            if event_data.get('type') == 'content_block_delta':
+                                text = event_data.get('delta', {}).get('text', '')
+                                if text:
+                                    content_parts.append(text)
+                                    stream_callback(text)
+                        except json.JSONDecodeError:
+                            pass
 
                     return ''.join(content_parts)
                 else:

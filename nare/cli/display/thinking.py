@@ -168,61 +168,18 @@ class ThinkingDisplay:
         self._stop_live_and_spinner()
 
     def update_progress(self, current: int, total: int, message: str = ""):
-        """Update progress indicator.
-
-        Args:
-            current: Current step
-            total: Total steps
-            message: Progress message
-        """
         self._stop_live_and_spinner()
-
         self.progress_current = current
         self.progress_total = total
         self.progress_message = message
 
         if self.mode == "solution":
             return
-
-        percent = int((current / total) * 100) if total > 0 else 0
-        bar_length = 20
-        filled = int((current / total) * bar_length) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_length - filled)
-
-        elapsed = time.time() - self.start_time
-        phase = (math.sin(elapsed * 2.0) + 1.0) / 2.0
-        r = int(180 + 75 * phase)
-        g = int(100 + 55 * phase)
-        b = int(60 + 40 * phase)
-        color = f"#{r:02x}{g:02x}{b:02x}"
-
-        ui.console.print(
-            f"  [{color}]▸[/] [#999999]{message} [{bar}] {percent}% ({current}/{total})[/]"
-        )
-        ui.console.file.flush()
-
-    def update_progress(self, current: int, total: int, message: str = ""):
-        """Update progress indicator.
-
-        Args:
-            current: Current step
-            total: Total steps
-            message: Progress message
-        """
-        self.progress_current = current
-        self.progress_total = total
-        self.progress_message = message
-
-        if self.mode == "solution":
-            return
-
-        self._stop_live_and_spinner()
 
         percent = int((current / total) * 100) if total > 0 else 0
         bar_length = 24
         filled = int((current / total) * bar_length) if total > 0 else 0
-
-        bar = "█" * filled + "░" * (bar_length - filled)
+        bar = "\u2588" * filled + "\u2591" * (bar_length - filled)
 
         elapsed = time.time() - self.start_time
         phase = (math.sin(elapsed * 2.0) + 1.0) / 2.0
@@ -232,8 +189,9 @@ class ThinkingDisplay:
         bar_color = f"#{r:02x}{g:02x}{b:02x}"
 
         ui.console.print(
-            f"  [{bar_color}]▸[/] [#888888]{message} [{bar_color}]{bar}[/{bar_color}] {percent}% ({current}/{total})[/]"
+            f"  [{bar_color}]\u25b8[/] [#888888]{message} [{bar_color}]{bar}[/{bar_color}] {percent}% ({current}/{total})[/]"
         )
+        ui.console.file.flush()
 
     def _update(self):
         """Update the live display."""

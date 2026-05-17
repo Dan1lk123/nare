@@ -4,6 +4,7 @@ import numpy as np
 import faiss
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from ...reasoning import llm
+from ...reasoning.generation.engine import ANTHROPIC_MODEL
 from ...memory.engine import MemorySystem
 from ...reasoning.generation.ranker import Critic
 from ...execution.sandboxes.base import SecurityError, safe_call_trigger, safe_call_execute_in_namespace, safe_execute_freeform, extract_python_block, safe_load_module
@@ -99,38 +100,10 @@ class ReasoningRouter:
                 thinking_display.start_waiting("Thinking")
                 thinking_display.switch_to_solution()
 
-            # Check if it's a simple greeting - return instant response
-            q = query.strip().lower()
-            greetings_map = {
-                'привет': 'Привет! Чем могу помочь?',
-                'ку': 'Привет! Чем могу помочь?',
-                'хай': 'Привет! Чем могу помочь?',
-                'здарова': 'Привет! Чем могу помочь?',
-                'здравствуйте': 'Здравствуйте! Чем могу помочь?',
-                'hi': 'Hi! How can I help you?',
-                'hello': 'Hello! How can I help you?',
-                'hey': 'Hey! What can I do for you?',
-                'yo': 'Hey! What can I do for you?',
-                'спасибо': 'Пожалуйста!',
-                'thanks': "You're welcome!",
-                'thank you': "You're welcome!",
-                'что?': 'Уточни, пожалуйста, что именно тебя интересует?',
-                'что': 'Уточни, пожалуйста, что именно тебя интересует?',
-                'как дела?': 'Всё отлично, работаю! Чем помочь?',
-                'как дела': 'Всё отлично, работаю! Чем помочь?',
-                'как ты?': 'Всё в порядке, готов помочь!',
-                'как ты': 'Всё в порядке, готов помочь!',
-                'ок': 'Хорошо!',
-                'ok': 'Okay!',
-                'понятно': 'Отлично! Что дальше?',
-                'да': 'Хорошо!',
-                'нет': 'Понял.',
-            }
-
-            if q in greetings_map:
-                answer = greetings_map[q]
+            hardcoded = self._get_hardcoded_response(query)
+            if hardcoded:
                 log.append("Route: DIRECT (instant greeting)")
-                return self._wrap_result("DIRECT", answer, [], [], log, 0.0, _solve_start, 0,
+                return self._wrap_result("DIRECT", hardcoded, [], [], log, 0.0, _solve_start, 0,
                                         query=query, chat_history=chat_history, repo_map=repo_map, intent=intent)
 
             # For other conversational queries, use LLM
@@ -195,7 +168,7 @@ class ReasoningRouter:
                             not answer or
                             answer.startswith("Error") or
                             "Skill for pattern:" in answer or
-                            "Based on" in answer and "similar tasks" in answer
+                            ("Based on" in answer and "similar tasks" in answer)
                         )
 
                         if answer and not is_placeholder:
@@ -1064,13 +1037,13 @@ Answer with just "ACTION" or "CONVERSATION"."""
             from ...reasoning import llm
 
             response = llm._post_anthropic("messages", {
-                "model": "claude-3-haiku-20240307",  # Fast model
+                "model": ANTHROPIC_MODEL,
                 "max_tokens": 10,
                 "temperature": 0.0,
                 "messages": [{"role": "user", "content": prompt}]
             })
 
-            result = response.get("content", [{}])[0].get("text", "").strip().upper()
+            result = response.strip().upper() if isinstance(response, str) else ""
 
             if "ACTION" in result:
                 return "EDIT"
@@ -1105,7 +1078,6 @@ Answer with just "ACTION" or "CONVERSATION"."""
             if query_lower.startswith(task):
                 return False
 
-        return False
         if len(query_lower) > 50:
             return True
 
