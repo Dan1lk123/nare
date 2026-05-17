@@ -54,6 +54,10 @@ class ReasoningRouter:
 
         self.route_metrics = RouteMetrics()
 
+        # Amortization tracking
+        self._query_count = 0
+        self._amortized_count = 0
+
     async def route(
         self,
         query: str,
@@ -95,8 +99,7 @@ class ReasoningRouter:
 
         if intent != "EDIT" and self._is_conversational(query):
             if thinking_display:
-                thinking_display.stream_token("| Direct response\n")
-                thinking_display.start_waiting("Thinking")
+                thinking_display.show_route("DIRECT")
                 thinking_display.switch_to_solution()
 
             # Check if it's a simple greeting - return instant response
@@ -153,18 +156,15 @@ class ReasoningRouter:
                                     query=query, chat_history=chat_history, repo_map=repo_map, intent=intent)
 
         if thinking_display:
-            thinking_display.update_waiting("Routing query...")
+            thinking_display.update_waiting("Routing...")
 
         adaptive_tau_fast = get_adaptive_tau_fast(query, self.config)
         logging.info(f"[ROUTER] Adaptive tau_fast: {adaptive_tau_fast:.2f} (base: {self.tau_fast:.2f})")
 
-        if thinking_display:
-            thinking_display.update_waiting("Computing query embedding...")
-
         query_emb = llm.get_embedding(query)
 
         if thinking_display:
-            thinking_display.update_waiting("Checking compiled skills...")
+            thinking_display.update_waiting("Matching skills...")
 
         # Unified skill path: check both compiled_skills and semantic_rules
         skills = self.memory.retrieve_skills(query_emb, k=3)
@@ -257,7 +257,8 @@ class ReasoningRouter:
 
                 if sims[0][0] >= adaptive_tau_fast:
                     if thinking_display:
-                        thinking_display.update_waiting(f"FAST route: validating cached solution (sim: {sims[0][0]:.2f})")
+                        thinking_display.show_route("FAST")
+                        thinking_display.start_waiting("Validating cached solution...")
 
                     idx = int(indices[0][0])
                     if 0 <= idx < len(self.memory.episodes):
@@ -266,7 +267,20 @@ class ReasoningRouter:
                         if ep.get('score', 0) >= 0.80:
                             fast_answer = self._post_process_answer(ep.get('solution', ''), "FAST", log)
 
-                            if oracle:
+                            # Pre-check: if the solution is empty or consists entirely of
+                            # XML tool calls that _wrap_result will strip, fall through
+                            import re as _re
+                            _stripped = fast_answer or ''
+                            _stripped = _re.sub(r'<(?:create_file|read_file|list_files|edit_file|write_file)>.*?</(?:create_file|read_file|list_files|edit_file|write_file)>', '', _stripped, flags=_re.DOTALL)
+                            _stripped = _re.sub(r'<tool_call[^>]*>.*?</tool_call>', '', _stripped, flags=_re.DOTALL)
+                            _stripped = _re.sub(r'<(?:reasoning|delta_reasoning|abstract_signature)\s*>.*?</(?:reasoning|delta_reasoning|abstract_signature)\s*>', '', _stripped, flags=_re.DOTALL)
+                            _stripped = _re.sub(r'<(?:final_answer|solution)\s*>|</(?:final_answer|solution)\s*>', '', _stripped)
+                            _stripped = _stripped.strip()
+
+                            if not _stripped:
+                                logging.info("[ROUTER] FAST cache solution is empty after XML cleanup, falling through to HYBRID/SLOW")
+                                log.append("FAST cache empty after cleanup - trying HYBRID/SLOW")
+                            elif oracle:
                                 if thinking_display:
                                     thinking_display.update_waiting("Validating with oracle...")
 
@@ -408,7 +422,8 @@ class ReasoningRouter:
 
         if max_sim >= self.tau_hybrid and retrieved_eps and not requires_action:
             if thinking_display:
-                thinking_display.start_waiting("HYBRID route: adapting previous solution")
+                thinking_display.show_route("HYBRID")
+                thinking_display.start_waiting("Adapting previous solution...")
 
             log.append(f"Route: HYBRID PATH (sim: {max_sim:.3f})")
             prompt = self._build_hybrid_prompt(full_query_context, retrieved_eps[0])
@@ -425,12 +440,18 @@ class ReasoningRouter:
             _solve_tokens += h_tokens
 
             if thinking_display:
-                thinking_display.update_waiting("Evaluating solution quality...")
+                thinking_display.update_waiting("Evaluating quality...")
 
             candidates = self.critic.evaluate(query, candidates, oracle=oracle)
             logging.info(f"[HYBRID] After critic: {len(candidates)} candidates")
             if candidates and isinstance(candidates[0], dict) and 'solution' in candidates[0]:
                 best = candidates[0]
+
+                # Save tool results that were collected during generation
+                tool_results_from_generation = ""
+                if thinking_display and hasattr(thinking_display, '_tool_results'):
+                    tool_results_from_generation = ''.join(thinking_display._tool_results)
+                    thinking_display._tool_results = []  # Clear after saving
 
                 from ...tools.parsing.executor import ToolExecutor
                 executor = ToolExecutor(working_dir=".")
@@ -443,7 +464,13 @@ class ReasoningRouter:
                         display_verb="Execute"
                     ))
 
-                cleaned_solution, modified_files = executor.parse_and_execute(best['solution'])
+                cleaned_solution, modified_files, tool_results = executor.parse_and_execute(best['solution'])
+
+                logging.info(f"[HYBRID] parse_and_execute returned {len(tool_results)} tool results")
+                logging.info(f"[HYBRID] tool_results_from_generation: {len(tool_results_from_generation)} chars")
+                if tool_results:
+                    for i, result in enumerate(tool_results):
+                        logging.info(f"[HYBRID] tool_result[{i}]: {result[:200]}")
 
                 # Emit ToolEnd event
                 if self.bus:
@@ -459,7 +486,68 @@ class ReasoningRouter:
                         body_lang=None
                     ))
 
-                best['solution'] = cleaned_solution
+                # Build final solution from cleaned text + tool results
+                final_parts = []
+                if cleaned_solution.strip():
+                    final_parts.append(cleaned_solution.strip())
+
+                analysis_text = None
+                # If we have tool results, ask model to analyze them
+                if tool_results:
+                    logging.info(f"[HYBRID] Asking model to analyze {len(tool_results)} tool results")
+
+                    analysis_prompt = f"""The following tool calls were executed:
+
+{chr(10).join(tool_results)}
+
+Provide a brief analysis/summary of what you found. Be concise and focus on key insights."""
+
+                    if thinking_display:
+                        thinking_display.update_waiting("Analyzing results...")
+
+                    import asyncio
+                    analysis_candidates, analysis_tokens = await asyncio.to_thread(
+                        llm.generate_samples,
+                        analysis_prompt, n=1, temperature=0.3, mode="DIRECT", thinking_display=thinking_display
+                    )
+                    _solve_tokens += analysis_tokens
+
+                    if analysis_candidates and analysis_candidates[0].get('solution'):
+                        analysis_text = analysis_candidates[0]['solution'].strip()
+                        logging.info(f"[HYBRID] Model analysis: {analysis_text[:200]}")
+                        final_parts.append(analysis_text)
+                    else:
+                        # Fallback: just show tool results
+                        final_parts.extend(tool_results)
+                else:
+                    # No tool results, just use cleaned solution
+                    pass
+
+                if tool_results_from_generation.strip():
+                    final_parts.append(tool_results_from_generation.strip())
+
+                best['solution'] = "\n\n".join(final_parts) if final_parts else "Executed successfully."
+
+                logging.info(f"[HYBRID] Final solution length: {len(best['solution'])} chars")
+                logging.info(f"[HYBRID] Final solution preview: {best['solution'][:300]}")
+
+                # Stream analysis to user if thinking_display is active
+                if thinking_display and analysis_text:
+                    logging.info(f"[HYBRID] Streaming analysis: {len(analysis_text)} chars")
+
+                    # Ensure we're in solution mode
+                    if hasattr(thinking_display, 'mode') and thinking_display.mode != 'solution':
+                        if hasattr(thinking_display, 'switch_to_solution'):
+                            thinking_display.switch_to_solution()
+                            logging.info(f"[HYBRID] Switched to solution mode")
+
+                    thinking_display.stream_token(f"\n\n{analysis_text}")
+
+                    # Flush to ensure output is visible
+                    if hasattr(thinking_display, '_stop_live_and_spinner'):
+                        thinking_display._stop_live_and_spinner()
+                else:
+                    logging.info(f"[HYBRID] NOT streaming analysis")
 
                 best['solution'] = self._post_process_answer(best['solution'], "HYBRID", log)
                 best['final_score'] = (max_sim * 1.0) + ((1 - max_sim) * best['final_score'])
@@ -483,12 +571,14 @@ class ReasoningRouter:
                 logging.warning(f"[ROUTER] HYBRID produced no valid candidates - falling back to SLOW")
                 log.append("HYBRID failed: no valid candidates - trying SLOW")
                 if thinking_display:
-                    thinking_display.update_waiting("HYBRID failed, trying SLOW...")
+                    thinking_display.show_route("SLOW")
+                    thinking_display.start_waiting("Falling back to synthesis...")
 
         log.append(f"Route: SLOW PATH (sim: {max_sim:.3f})")
 
         if thinking_display:
-            thinking_display.update_waiting("SLOW route: synthesizing solution from scratch...")
+            thinking_display.show_route("SLOW")
+            thinking_display.start_waiting("Synthesizing solution...")
 
         adaptive_params = self._assess_task_complexity(full_query_context, thinking_display=None) if max_sim < 0.3 else {}
 
@@ -1070,7 +1160,7 @@ Answer with just "ACTION" or "CONVERSATION"."""
                 "messages": [{"role": "user", "content": prompt}]
             })
 
-            result = response.get("content", [{}])[0].get("text", "").strip().upper()
+            result = response.strip().upper() if isinstance(response, str) else ""
 
             if "ACTION" in result:
                 return "EDIT"
@@ -1104,10 +1194,6 @@ Answer with just "ACTION" or "CONVERSATION"."""
         for task in simple_tasks:
             if query_lower.startswith(task):
                 return False
-
-        return False
-        if len(query_lower) > 50:
-            return True
 
         return False
 
@@ -1191,6 +1277,15 @@ Answer with just "ACTION" or "CONVERSATION"."""
         return None
 
     def _wrap_result(self, route, answer, memories, candidates, log, alpha, start_time, tokens, alpha_t=0.0, query="", chat_history="", repo_map="", intent=""):
+        # Track amortization
+        self._query_count += 1
+        if route in ("FAST", "REFLEX", "COMPILED_SKILL", "DIRECT"):
+            self._amortized_count += 1
+        alpha_t_empirical = self._amortized_count / self._query_count if self._query_count > 0 else 0.0
+        c_llm = self.config.amortization.c_llm
+        c_mem = self.config.amortization.c_mem
+        blended_cost = (1.0 - alpha_t_empirical) * c_llm + alpha_t_empirical * c_mem
+        logging.info(f"[AMORTIZATION] α_t={alpha_t_empirical:.3f}, C_t={blended_cost:.1f}, route={route}, queries={self._query_count}")
         # Clean up any XML tags that model might have generated by mistake
         import re
         if answer:
@@ -1215,11 +1310,23 @@ Answer with just "ACTION" or "CONVERSATION"."""
 
             answer = '\n'.join(filtered_lines)
 
-            # Remove other common XML tags that shouldn't be in final answer
+            # Remove XML-style tool calls: <read_file>path</read_file>, <list_files>path</list_files>, etc.
+            answer = re.sub(r'<read_file>.*?</read_file>', '', answer, flags=re.DOTALL)
+            answer = re.sub(r'<list_files>.*?</list_files>', '', answer, flags=re.DOTALL)
+            answer = re.sub(r'<create_file>.*?</create_file>', '', answer, flags=re.DOTALL)
+            answer = re.sub(r'<edit_file>.*?</edit_file>', '', answer, flags=re.DOTALL)
+            answer = re.sub(r'<write_file>.*?</write_file>', '', answer, flags=re.DOTALL)
+
             answer = re.sub(r'<final_answer\s*>|</final_answer\s*>', '', answer)
             answer = re.sub(r'<reasoning\s*>.*?</reasoning\s*>', '', answer, flags=re.DOTALL)
+            answer = re.sub(r'<delta_reasoning\s*>.*?</delta_reasoning\s*>', '', answer, flags=re.DOTALL)
+            answer = re.sub(r'<abstract_signature\s*>.*?</abstract_signature\s*>', '', answer, flags=re.DOTALL)
             answer = re.sub(r'<solution\s*>|</solution\s*>', '', answer)
-            answer = answer.strip()
+            answer = re.sub(
+                r'\{\s*"name"\s*:\s*"(?:create_file|edit_file|read_file|list_files|list_dir|write_file)"\s*,\s*"args"\s*:\s*\{[^}]*\}\s*\}',
+                '', answer
+            )
+            answer = re.sub(r'\n{3,}', '\n\n', answer).strip()
 
         result = {
             "route_decision": route,
@@ -1228,7 +1335,10 @@ Answer with just "ACTION" or "CONVERSATION"."""
             "generated_candidates": candidates,
             "memory_update_log": log,
             "alpha": float(alpha),
-            "alpha_t": float(alpha_t),
+            "alpha_t": float(alpha_t_empirical),
+            "alpha_t_theoretical": float(alpha_t),
+            "blended_cost": float(blended_cost),
+            "amortization_ratio": float(alpha_t_empirical),
             "novelty": 0.0,
             "elapsed": time.time() - start_time,
             "tokens": tokens

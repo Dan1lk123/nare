@@ -51,21 +51,38 @@ def _ensure_api_key():
             "export it in the current shell. See .env.example for details."
         )
 
+def _make_cached_system(system_prompt: str) -> list:
+    """Split system prompt into cacheable static block."""
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"}
+    }]
+
+
 def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
-    """POST to the configured LLM endpoint using stdlib urllib."""
+    """POST to the configured LLM endpoint with prompt caching support."""
     import urllib.request
     import urllib.error
 
     if stream_callback:
         payload['stream'] = True
 
+    if 'system' in payload and isinstance(payload['system'], str):
+        payload['system'] = _make_cached_system(payload['system'])
+
     url = f"{ANTHROPIC_BASE_URL}/{endpoint}"
     data = json.dumps(payload).encode('utf-8')
     headers = {
         'Content-Type': 'application/json',
         'x-api-key': ANTHROPIC_AUTH_TOKEN,
-        'anthropic-version': '2023-06-01'
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'prompt-caching-2024-07-31'
     }
+
+    nare_license = os.getenv("NARE_API_KEY", "")
+    if nare_license:
+        headers['Authorization'] = f'Bearer {nare_license}'
 
     retries = 5
     for attempt in range(retries):
@@ -74,29 +91,46 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
             with urllib.request.urlopen(req, timeout=120) as response:
 
                 if stream_callback:
-                    content_parts = []
+                    import codecs
                     import sys
+                    content_parts = []
+                    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+                    buffer = ""
 
                     while True:
-                        line = response.readline()
-                        if not line:
+                        chunk = response.read(4096)
+                        if not chunk:
                             break
+                        buffer += decoder.decode(chunk)
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line_str = line.strip()
+                            if line_str.startswith('data: '):
+                                try:
+                                    event_data = json.loads(line_str[6:])
+                                    if event_data.get('type') == 'content_block_delta':
+                                        delta = event_data.get('delta', {})
+                                        text = delta.get('text', '')
+                                        if text:
+                                            content_parts.append(text)
+                                            stream_callback(text)
+                                            sys.stdout.flush()
+                                except json.JSONDecodeError:
+                                    continue
 
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-
-                        if line_str.startswith('data: '):
-                            try:
-                                event_data = json.loads(line_str[6:])
-
-                                if event_data.get('type') == 'content_block_delta':
-                                    delta = event_data.get('delta', {})
-                                    text = delta.get('text', '')
-                                    if text:
-                                        content_parts.append(text)
-                                        stream_callback(text)
-                                        sys.stdout.flush()
-                            except json.JSONDecodeError:
-                                continue
+                    remaining = decoder.decode(b'', final=True)
+                    if remaining:
+                        buffer += remaining
+                    if buffer.strip().startswith('data: '):
+                        try:
+                            event_data = json.loads(buffer.strip()[6:])
+                            if event_data.get('type') == 'content_block_delta':
+                                text = event_data.get('delta', {}).get('text', '')
+                                if text:
+                                    content_parts.append(text)
+                                    stream_callback(text)
+                        except json.JSONDecodeError:
+                            pass
 
                     return ''.join(content_parts)
                 else:
@@ -143,32 +177,46 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
                     return body_str
 
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else ''
+            error_body = ''
+            try:
+                error_body = e.read().decode('utf-8', errors='replace')
+            except Exception:
+                pass
             if e.code == 429:
                 base_wait = min(10 * (2 ** attempt), 60)
                 jitter = random.uniform(0, base_wait * 0.1)
                 wait_time = base_wait + jitter
-                logging.warning(f"Rate limit (429). Waiting {wait_time:.1f}s... (Attempt {attempt+1}/{retries})")
+                logging.warning(f"Rate limit (429). Retrying in {wait_time:.1f}s (attempt {attempt+1}/{retries})")
                 if attempt < retries - 1:
                     time.sleep(wait_time)
                     continue
-                else:
-                    raise Exception("Max retries exceeded for API request.")
-            elif e.code == 400:
-                logging.error(f"HTTP 400 Bad Request. Response: {error_body[:500]}")
-                raise
+                raise RuntimeError("Max retries exceeded (429)")
+            elif e.code in (500, 502, 503, 504):
+                if attempt < retries - 1:
+                    wait_time = min(5 * (2 ** attempt), 30)
+                    logging.warning(f"HTTP {e.code}, retrying in {wait_time}s (attempt {attempt+1}/{retries})")
+                    time.sleep(wait_time)
+                    continue
+                raise RuntimeError(f"LLM HTTP {e.code}: {error_body[:300]}")
             else:
-                logging.error(f"HTTP {e.code}. Response: {error_body[:500]}")
-                raise
+                raise RuntimeError(f"LLM HTTP {e.code}: {error_body[:300]}")
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                wait_time = min(5 * (2 ** attempt), 30)
+                logging.warning(f"Connection error (attempt {attempt+1}/{retries}): {e}")
+                time.sleep(wait_time)
+                continue
+            raise RuntimeError(f"LLM connection failed: {e}")
+        except RuntimeError:
+            raise
         except Exception as e:
             if attempt == retries - 1:
-                raise
+                raise RuntimeError(f"LLM API error: {e}")
             wait_time = min(5 * (2 ** attempt), 30)
             logging.warning(f"LLM API error (attempt {attempt+1}/{retries}): {e}")
-            if attempt < retries - 1:
-                time.sleep(wait_time)
+            time.sleep(wait_time)
 
-    raise Exception("Max retries exceeded for LLM API")
+    raise RuntimeError("LLM max retries exceeded")
 
 _embedding_model = None
 
@@ -248,12 +296,30 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
         in_solution = False
         in_abstract = False
         in_tool_call = False
+        in_xml_tool = False
+        xml_tool_name = ""
+        xml_tool_buffer = ""
         buffer = ""
         seen_first_tag = False
         tool_call_buffer = ""
 
+        _XML_TOOL_TAGS = ('read_file', 'create_file', 'edit_file', 'list_files', 'write_file')
+
+        def _execute_xml_tool(tool_tag: str, content: str):
+            """Execute an XML-style tool call and return result."""
+            try:
+                from nare.tools.parsing.executor import parse_tool_calls, execute_tool_call
+                fake_xml = f'<{tool_tag}>{content}</{tool_tag}>'
+                calls = parse_tool_calls(fake_xml)
+                if calls:
+                    result = execute_tool_call(calls[0]['tool'], calls[0]['args'], working_dir='.')
+                    return result
+            except Exception as e:
+                logging.warning(f'[XML_TOOL] Failed to execute {tool_tag}: {e}')
+            return None
+
         def callback(token: str):
-            nonlocal in_reasoning, in_delta, in_solution, in_abstract, in_tool_call, buffer, seen_first_tag, tool_call_buffer
+            nonlocal in_reasoning, in_delta, in_solution, in_abstract, in_tool_call, in_xml_tool, xml_tool_name, xml_tool_buffer, buffer, seen_first_tag, tool_call_buffer
             buffer += token
 
             # ALWAYS filter out <tool_call> blocks first (with whitespace handling)
@@ -352,7 +418,16 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                                 display_verb=None
                             ))
 
-                            # Append tool result to solution so it appears in final answer
+                            # Stream tool result immediately so it appears in real-time
+                            if thinking_display:
+                                # Ensure we're in solution mode before streaming results
+                                if hasattr(thinking_display, 'mode') and thinking_display.mode != 'solution':
+                                    if hasattr(thinking_display, 'switch_to_solution'):
+                                        thinking_display.switch_to_solution()
+
+                                thinking_display.stream_token(f"\n{result_msg}\n")
+
+                            # Also append to _tool_results for final answer assembly
                             if hasattr(thinking_display, '_tool_results'):
                                 thinking_display._tool_results.append(f"\n{result_msg}")
                             else:
@@ -363,7 +438,7 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
                         logging.warning(traceback.format_exc())
                     return
 
-            if mode in ("DIRECT", "SYNTHESIS", "DATA"):
+            if mode in ("DIRECT", "SYNTHESIS"):
                 thinking_display.stream_token(token)
                 return
 
@@ -381,7 +456,6 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
             if "<reasoning>" in buffer and not in_reasoning:
                 in_reasoning = True
                 seen_first_tag = True
-
                 buffer = buffer.split("<reasoning>", 1)[1]
                 return
 
@@ -402,49 +476,93 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
             if in_reasoning:
                 if "</reasoning>" in buffer:
-
-                    final_text = buffer.split("</reasoning>", 1)[0]
-                    if final_text:
-                        thinking_display.stream_token(final_text)
+                    before = buffer.split("</reasoning>", 1)[0]
+                    if before.strip():
+                        thinking_display.stream_token(before)
                     in_reasoning = False
                     buffer = ""
                 else:
-                    partial_tags = ['<', '</', '</r', '</re', '</rea', '</reas', '</reaso', '</reason', '</reasoni', '</reasonin']
-                    if not any(buffer.endswith(p) for p in partial_tags):
-                        if buffer:
-                            thinking_display.stream_token(buffer)
-                        buffer = ""
+                    thinking_display.stream_token(buffer)
+                    buffer = ""
             elif in_delta:
                 if "</delta_reasoning>" in buffer:
-                    final_text = buffer.split("</delta_reasoning>", 1)[0]
-                    if final_text:
-                        thinking_display.stream_token(final_text)
+                    before = buffer.split("</delta_reasoning>", 1)[0]
+                    if before.strip():
+                        thinking_display.stream_token(before)
                     in_delta = False
                     buffer = ""
                 else:
-                    partial_tags = ['<', '</', '</d', '</de', '</del', '</delt', '</delta', '</delta_', '</delta_r', '</delta_re', '</delta_rea', '</delta_reas', '</delta_reaso', '</delta_reason', '</delta_reasoni', '</delta_reasonin', '</delta_reasoning']
-                    if not any(buffer.endswith(p) for p in partial_tags):
-                        if buffer:
-                            thinking_display.stream_token(buffer)
-                        buffer = ""
+                    thinking_display.stream_token(buffer)
+                    buffer = ""
             elif in_solution:
-                if "</solution>" in buffer:
+                # Handle XML tool call accumulation
+                if in_xml_tool:
+                    xml_tool_buffer += buffer
+                    buffer = ""
+                    close_tag = f'</{xml_tool_name}>'
+                    if close_tag in xml_tool_buffer:
+                        content = xml_tool_buffer.split(close_tag, 1)[0]
+                        remainder = xml_tool_buffer.split(close_tag, 1)[1]
+                        in_xml_tool = False
 
+                        result = _execute_xml_tool(xml_tool_name, content)
+                        xml_tool_name = ""
+                        xml_tool_buffer = ""
+
+                        if result:
+                            thinking_display.stream_token(f"\n{result}\n")
+                            if hasattr(thinking_display, '_tool_results'):
+                                thinking_display._tool_results.append(f"\n{result}")
+                            else:
+                                thinking_display._tool_results = [f"\n{result}"]
+
+                        if remainder.strip():
+                            buffer = remainder
+                    return
+
+                # Check for XML tool call opening tags in buffer
+                import re as _re
+                xml_tool_match = _re.search(r'<(' + '|'.join(_XML_TOOL_TAGS) + r')>', buffer)
+                if xml_tool_match:
+                    before = buffer[:xml_tool_match.start()]
+                    if before.strip():
+                        thinking_display.stream_token(before)
+                    in_xml_tool = True
+                    xml_tool_name = xml_tool_match.group(1)
+                    xml_tool_buffer = buffer[xml_tool_match.end():]
+                    buffer = ""
+                    return
+
+                if "</solution>" in buffer:
                     final_text = buffer.split("</solution>", 1)[0]
                     if final_text:
                         thinking_display.stream_token(final_text)
+
+                    if hasattr(thinking_display, '_tool_results') and thinking_display._tool_results:
+                        tool_results_text = ''.join(thinking_display._tool_results)
+                        if tool_results_text.strip():
+                            thinking_display.stream_token(tool_results_text)
+
                     in_solution = False
                     buffer = ""
-                    # Don't stream the closing tag
                 else:
-                    partial_tags = ['<', '</', '</s', '</so', '</sol', '</solu', '</solut', '</soluti', '</solutio', '</solution']
+                    # Hold buffer if it might contain a partial opening/closing tag
+                    partial_tags = [
+                        '<', '</', '</s', '</so', '</sol', '</solu', '</solut', '</soluti', '</solutio', '</solution',
+                        '<r', '<re', '<rea', '<read', '<read_', '<read_f', '<read_fi', '<read_fil', '<read_file',
+                        '<c', '<cr', '<cre', '<crea', '<creat', '<create', '<create_', '<create_f', '<create_fi', '<create_fil', '<create_file',
+                        '<e', '<ed', '<edi', '<edit', '<edit_', '<edit_f', '<edit_fi', '<edit_fil', '<edit_file',
+                        '<l', '<li', '<lis', '<list', '<list_', '<list_f', '<list_fi', '<list_fil', '<list_file', '<list_files',
+                        '<w', '<wr', '<wri', '<writ', '<write', '<write_', '<write_f', '<write_fi', '<write_fil', '<write_file',
+                    ]
                     if not any(buffer.endswith(p) for p in partial_tags):
                         if buffer:
                             thinking_display.stream_token(buffer)
                         buffer = ""
             elif not seen_first_tag:
-
-                pass
+                # Discard all text before first tag - it's preamble/reasoning that shouldn't leak
+                buffer = ""
+                return
 
             # Always filter out closing tags even if we're not in the corresponding mode
             # This handles cases where model generates closing tags without opening tags
@@ -457,15 +575,30 @@ def generate_samples(prompt: str, n: int = 3, temperature: float = 0.8, mode: st
 
     if mode == "ANALYTIC":
         system_prompt = """Tools: create_file, edit_file, read_file, list_files.
-Format: <reasoning>plan</reasoning><solution>tool calls + result</solution>"""
+Tool call format:
+<read_file>filepath</read_file>
+<create_file><path>filepath</path><content>content</content></create_file>
+<edit_file><path>filepath</path><old>old text</old><new>new text</new></edit_file>
+<list_files>directory</list_files>
+Response format: <reasoning>plan</reasoning><solution>tool calls + brief progress notes + result</solution>
+IMPORTANT: Between tool calls, add brief progress notes like "Analyzing structure...", "Understanding architecture...", "Checking components..."."""
     elif mode == "DATA":
         system_prompt = """Tools: read_file, list_files.
-Execute tool call and return ONLY the raw result. NO interpretation, NO analysis, NO explanations.
-Format: <solution>tool call</solution>"""
+Tool call format:
+<read_file>filepath</read_file>
+<list_files>directory</list_files>
+Execute tool and return ONLY raw output. NO commentary, NO interpretation.
+Response format: <solution>tool call</solution>"""
     elif mode == "SYNTHESIS":
         system_prompt = "Output ONLY code in specified format. No explanations."
     elif mode == "ADAPTIVE":
-        system_prompt = "Adapt previous solution. Format: <delta_reasoning>changes</delta_reasoning><solution>answer</solution>"
+        system_prompt = """Adapt previous solution.
+Tool call format:
+<read_file>filepath</read_file>
+<create_file><path>filepath</path><content>content</content></create_file>
+<edit_file><path>filepath</path><old>old text</old><new>new text</new></edit_file>
+Response format: <solution>tool calls ONLY, NO reasoning text</solution>
+CRITICAL: Do NOT write reasoning or explanations. ONLY tool calls. Analysis will be generated separately."""
     elif mode == "REACTIVE":
         system_prompt = "Apply rule. Format: <rule_activation>name</rule_activation><solution>answer</solution>"
     else:
@@ -530,8 +663,14 @@ Format: <solution>tool call</solution>"""
 
                 solution = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', solution, flags=re.DOTALL).strip()
             else:
-
-                solution = content.strip()
+                # No tags found - check if there's text before <solution>
+                # Remove everything before <solution> tag if it exists
+                if '<solution>' in content:
+                    solution = content.split('<solution>', 1)[1].strip()
+                    if '</solution>' in solution:
+                        solution = solution.split('</solution>', 1)[0].strip()
+                else:
+                    solution = content.strip()
 
                 solution = re.sub(r'<reasoning>.*?</reasoning>', '', solution, flags=re.DOTALL).strip()
                 solution = re.sub(r'<abstract_signature>.*?</abstract_signature>', '', solution, flags=re.DOTALL).strip()
@@ -904,6 +1043,7 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
     negative_pass = 0
     positive_total = 0
     positive_no_crash = 0
+    positive_oracle_pass = 0
 
     for ep in stress_eps:
         is_negative = ep.get('type') == 'NEGATIVE'
@@ -924,6 +1064,10 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
             result_str = str(result).strip()
             if not result_str.startswith("Error"):
                 positive_no_crash += 1
+                if vcfg.include_positive_stress and oracle is not None:
+                    ok, _ = oracle(ep['query'], result_str)
+                    if ok:
+                        positive_oracle_pass += 1
         except Exception as e:
             if is_negative:
                 negative_total += 1
@@ -932,6 +1076,7 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
 
     negative_trap_accuracy = negative_pass / negative_total if negative_total > 0 else 1.0
     positive_no_crash_rate = positive_no_crash / positive_total if positive_total > 0 else 1.0
+    positive_oracle_rate = positive_oracle_pass / positive_total if positive_total > 0 else 1.0
 
     overall = (
         vcfg.w_trigger * trigger_accuracy
@@ -939,6 +1084,11 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
         + vcfg.w_negative_trap * negative_trap_accuracy
     )
     weight_sum = vcfg.w_trigger + vcfg.w_execute + vcfg.w_negative_trap
+
+    if vcfg.include_positive_stress:
+        overall += vcfg.w_positive_stress * positive_oracle_rate
+        weight_sum += vcfg.w_positive_stress
+
     overall = overall / weight_sum if weight_sum > 0 else 0.0
 
     if trigger_accuracy < vcfg.minimum_trigger_accuracy or execute_accuracy < vcfg.minimum_execute_accuracy:

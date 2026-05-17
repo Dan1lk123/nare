@@ -2,6 +2,7 @@
 
 import os
 import json
+import codecs
 import urllib.request
 import logging
 
@@ -23,24 +24,47 @@ def _post_anthropic(endpoint: str, payload: dict, retries: int = 10) -> str:
         'anthropic-beta': 'prompt-caching-2024-07-31',
     }
 
+    nare_license = os.getenv("NARE_API_KEY", "")
+    if nare_license:
+        headers['Authorization'] = f'Bearer {nare_license}'
+
     for attempt in range(retries):
         req = urllib.request.Request(url, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=300) as response:
 
                 content_parts = []
-                for line in response:
-                    line = line.decode('utf-8').strip()
-                    if line.startswith('data: '):
-                        try:
-                            event_data = json.loads(line[6:])
-                            if event_data.get('type') == 'content_block_delta':
-                                delta = event_data.get('delta', {})
-                                text = delta.get('text', '')
-                                if text:
-                                    content_parts.append(text)
-                        except json.JSONDecodeError:
-                            continue
+                decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+                buffer = ""
+
+                for chunk in response:
+                    buffer += decoder.decode(chunk)
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line_str = line.strip()
+                        if line_str.startswith('data: '):
+                            try:
+                                event_data = json.loads(line_str[6:])
+                                if event_data.get('type') == 'content_block_delta':
+                                    delta = event_data.get('delta', {})
+                                    text = delta.get('text', '')
+                                    if text:
+                                        content_parts.append(text)
+                            except json.JSONDecodeError:
+                                continue
+
+                remaining = decoder.decode(b'', final=True)
+                if remaining:
+                    buffer += remaining
+                if buffer.strip().startswith('data: '):
+                    try:
+                        event_data = json.loads(buffer.strip()[6:])
+                        if event_data.get('type') == 'content_block_delta':
+                            text = event_data.get('delta', {}).get('text', '')
+                            if text:
+                                content_parts.append(text)
+                    except json.JSONDecodeError:
+                        pass
 
                 return ''.join(content_parts)
 

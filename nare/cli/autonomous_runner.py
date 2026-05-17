@@ -38,7 +38,9 @@ class AutonomousRunner:
         self.is_running = False
         self.max_iterations = 50
         self.max_errors = 3
+        self.max_clarifications = 1
         self.error_count = 0
+        self.clarification_count = 0
 
     def should_run_autonomously(self, query: str) -> bool:
         """Detect if query needs autonomous execution.
@@ -156,6 +158,19 @@ Answer:"""
                 last_result = result
 
                 self.error_count = 0
+
+                answer_text = result.get("final_answer", "")
+                if self._is_clarification_request(answer_text):
+                    self.clarification_count += 1
+                    if self.clarification_count > self.max_clarifications:
+                        log.warning("[Autonomous] Clarification budget exceeded, proceeding autonomously")
+                        current_query = (
+                            f"{current_query}\n\n"
+                            "INSTRUCTION: Do NOT ask for clarification. "
+                            "Make reasonable assumptions based on context and proceed with implementation. "
+                            "Use available project files and structure to infer intent."
+                        )
+                        continue
 
                 # Check if task is complete
                 if self._is_task_complete(result):
@@ -347,6 +362,27 @@ Answer:"""
 
         return None
 
+    def _is_clarification_request(self, answer: str) -> bool:
+        answer_lower = answer.lower()
+        clarification_patterns = [
+            "could you clarify",
+            "can you clarify",
+            "please clarify",
+            "what do you mean",
+            "could you provide more",
+            "can you provide more",
+            "i need more information",
+            "please specify",
+            "what exactly",
+            "which specific",
+            "could you elaborate",
+            "can you elaborate",
+            "уточните",
+            "что именно",
+            "можете уточнить",
+            "не совсем понял",
+        ]
+        return any(pattern in answer_lower for pattern in clarification_patterns)
+
     def stop(self):
-        """Stop autonomous execution."""
         self.is_running = False
