@@ -310,9 +310,19 @@ class MemoryCommand(Command):
         episodes = info.get("episodes", 0)
         skills = info.get("skills", 0)
 
-        high_quality = int(episodes * 0.3)
-        mature = int(skills * 0.6)
+        # Compute real stats from memory instead of fake ratios
+        memory = session.agent.memory
+        high_quality = sum(1 for ep in memory.episodes if ep.get('score', 0) >= 0.80)
+        mature = sum(1 for sk in memory.compiled_skills if sk.get('use_count', 0) >= 3)
+
+        # Real cache hit rate from router metrics
         cache_hit_rate = 0.0
+        if hasattr(session.agent, 'router') and hasattr(session.agent.router, 'route_metrics'):
+            rm_stats = session.agent.router.route_metrics.get_stats()
+            total_q = rm_stats.get('total_queries', 0)
+            if total_q > 0:
+                fast_count = rm_stats.get('route_distribution', {}).get('FAST', 0)
+                cache_hit_rate = fast_count
 
         ui.console.print()
         MemoryStats.render(
@@ -563,12 +573,44 @@ class SkillsCommand(Command):
 
         # Handle /skills compile subcommand
         if arg == "compile":
+            if not (hasattr(session, 'agent') and session.agent and hasattr(session.agent, 'evolution')):
+                ui.print_error("Evolution engine not available — agent not initialized")
+                return
+
+            memory = session.agent.memory
+            episodes = memory.episodes
+            high_score = [ep for ep in episodes if ep.get('score', 0) >= 0.80]
+            with_emb = [ep for ep in high_score if 'embedding' in ep]
+
+            ui.console.print()
+            ui.print_status("Episodes in memory", str(len(episodes)))
+            ui.print_status("High-score (≥0.80)", str(len(high_score)))
+            ui.print_status("With embeddings", str(len(with_emb)))
+
+            if len(with_emb) < 3:
+                ui.console.print()
+                ui.print_warning(
+                    f"Need ≥3 episodes with embeddings for compilation (have {len(with_emb)})"
+                )
+                ui.console.print("  [#666666]Keep using NARE — episodes are saved automatically from SLOW/HYBRID/REFLEX routes[/]")
+                ui.console.print()
+                return
+
+            def _on_compile_done(before, after, error):
+                if error:
+                    ui.print_error(f"Compilation failed: {error}")
+                elif after > before:
+                    ui.print_success(f"Compiled {after - before} new skill(s) — total: {after}")
+                    ui.console.print("  [#666666]Run /skills to inspect[/]")
+                else:
+                    ui.print_warning("No new skills compiled — episodes may be too diverse for clustering")
+
+            ui.console.print()
             ui.print_status("Compilation", "starting", "info")
-            if hasattr(session, 'agent') and session.agent and hasattr(session.agent, 'evolution'):
-                session.agent.evolution.run_compilation_cycle()
-                ui.print_status("Compilation", "running in background", "success")
-            else:
-                ui.print_error("Evolution engine not available - agent not initialized")
+            session.agent.evolution.run_compilation_cycle(on_complete=_on_compile_done)
+            ui.print_success("Compilation running in background")
+            ui.console.print("  [#666666]Results will appear when complete[/]")
+            ui.console.print()
             return
 
         # Try to get skills from agent first
@@ -694,12 +736,23 @@ class MetricsCommand(Command):
             bar = "█" * bar_length
             ui.console.print(f"    {route:20s} {pct:5.1%} {bar}", style="#999999")
 
+        # Amortization stats
+        if hasattr(session.agent, 'get_amortization_stats'):
+            amor = session.agent.get_amortization_stats()
+            ui.console.print()
+            ui.console.print("  Amortization:", style="#D77757")
+            ui.console.print(f"    α_t (empirical)     {amor.get('alpha_t', 0):.1%}", style="#999999")
+            ui.console.print(f"    α_t (theoretical)   {amor.get('alpha_t_theoretical', 0):.1%}", style="#999999")
+            ui.console.print(f"    Blended cost        {amor.get('blended_cost', 0):.1f}", style="#999999")
+            ui.console.print(f"    Amortized queries   {amor.get('amortized_queries', 0)} / {amor.get('total_queries', 0)}", style="#999999")
+            ui.console.print(f"    Memory size         {amor.get('memory_size', 0)} episodes", style="#999999")
+            ui.console.print(f"    Skills count        {amor.get('skills_count', 0)}", style="#999999")
+
         # Top skills
         if stats["top_skills"]:
             ui.console.print()
             ui.console.print("  Top Skills:", style="#D77757")
             for pattern, count in stats["top_skills"]:
-                # Truncate long patterns
                 if len(pattern) > 50:
                     pattern = pattern[:47] + "..."
                 ui.console.print(f"    {pattern:50s} {count:3d} uses", style="#999999")
@@ -831,6 +884,152 @@ class AutonomyCommand(Command):
             ui.print_error(f"Invalid autonomy level: {level_name}")
             ui.console.print("  [#666666]Valid levels: supervised, assisted, autonomous[/]")
 
+class SetupCommand(Command):
+    name = "setup"
+    aliases = ["configure", "init"]
+    help = "Interactive setup wizard for NARE reasoning provider"
+
+    def execute(self, session: NareSession, arg: str):
+        from rich.panel import Panel
+        from rich.prompt import Prompt, IntPrompt
+
+        ui.console.print()
+        ui.console.print(Panel(
+            "[bold #D77757]NARE Setup Wizard[/]\n\n"
+            "Configure the reasoning provider for NARE CLI.",
+            border_style="#444444",
+            padding=(1, 2),
+        ))
+
+        ui.console.print("  [bold #D77757]1[/]  [white]Cloud Provider API[/]  [#666666]— Anthropic / OpenAI / Google[/]")
+        ui.console.print("  [bold #D77757]2[/]  [white]Local Cortex-1[/]  [#666666]— 100% Free & Offline (requires CUDA)[/]")
+        ui.console.print("  [bold #D77757]3[/]  [white]Cortex Cloud API[/]  [#666666]— Managed SaaS (api.nare.ai)[/]")
+        ui.console.print()
+
+        choice = IntPrompt.ask("  [#999999]Select provider[/]", choices=["1", "2", "3"], default=1)
+
+        from nare.config.api_keys import get_api_key_manager
+        km = get_api_key_manager()
+
+        if choice == 1:
+            ui.console.print()
+            ui.console.print("  [bold #D77757]Cloud Provider API[/]")
+            ui.console.print("  [#666666]Select your LLM provider:[/]")
+            ui.console.print()
+            ui.console.print("  [bold #D77757]a[/]  Anthropic (Claude)")
+            ui.console.print("  [bold #D77757]b[/]  OpenAI (GPT)")
+            ui.console.print("  [bold #D77757]c[/]  Google (Gemini)")
+            ui.console.print()
+
+            provider = Prompt.ask("  [#999999]Provider[/]", choices=["a", "b", "c"], default="a")
+
+            provider_map = {
+                "a": ("anthropic", "ANTHROPIC_API_KEY"),
+                "b": ("openai", "OPENAI_API_KEY"),
+                "c": ("google", "GOOGLE_API_KEY"),
+            }
+            provider_name, env_key = provider_map[provider]
+
+            existing = os.environ.get(env_key, "")
+            if existing:
+                ui.console.print(f"  [#666666]Found {env_key} in environment[/]")
+                use_existing = Prompt.ask("  [#999999]Use existing key?[/]", choices=["y", "n"], default="y")
+                if use_existing == "y":
+                    km.set_key(provider_name, existing)
+                    ui.console.print(f"  [green]Configured {provider_name} provider[/]")
+                    return
+
+            api_key = Prompt.ask(f"  [#999999]Enter {env_key}[/]", password=True)
+            if api_key.strip():
+                km.set_key(provider_name, api_key.strip())
+                os.environ[env_key] = api_key.strip()
+                ui.console.print(f"  [green]Configured {provider_name} provider[/]")
+            else:
+                ui.console.print("  [red]No key provided, setup cancelled[/]")
+
+        elif choice == 2:
+            ui.console.print()
+            ui.console.print("  [bold #D77757]Local Cortex-1 (Offline)[/]")
+
+            cuda_available = False
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available()
+            except ImportError:
+                pass
+
+            if cuda_available:
+                ui.console.print("  [green]CUDA detected[/]")
+            else:
+                ui.console.print("  [yellow]CUDA not detected — CPU inference will be slower[/]")
+
+            endpoint = Prompt.ask(
+                "  [#999999]Local endpoint[/]",
+                default="http://localhost:8000"
+            )
+
+            km.set_key("local", "local-cortex-1")
+            import json
+            config_file = km.config_file
+            try:
+                config = {}
+                if config_file.exists():
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                config['provider'] = 'local'
+                config['local_endpoint'] = endpoint
+
+                import tempfile
+                fd, tmp = tempfile.mkstemp(dir=str(km.config_dir), suffix='.tmp')
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(config, f, indent=2)
+                os.replace(tmp, str(config_file))
+            except Exception:
+                pass
+
+            os.environ["ANTHROPIC_BASE_URL"] = endpoint
+            ui.console.print(f"  [green]Configured local Cortex-1 at {endpoint}[/]")
+
+        elif choice == 3:
+            ui.console.print()
+            ui.console.print("  [bold #D77757]Cortex Cloud API (SaaS)[/]")
+            ui.console.print("  [#666666]Connects to https://api.nare.ai[/]")
+            ui.console.print()
+
+            license_key = Prompt.ask("  [#999999]Enter your NARE License Key[/]", password=True)
+            if not license_key.strip():
+                ui.console.print("  [red]No license key provided, setup cancelled[/]")
+                return
+
+            license_key = license_key.strip()
+            km.set_key("nare_cloud", license_key)
+
+            import json
+            config_file = km.config_file
+            try:
+                config = {}
+                if config_file.exists():
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                config['provider'] = 'nare_cloud'
+                config['nare_api_key'] = license_key
+                config['nare_endpoint'] = 'https://api.nare.ai'
+
+                import tempfile
+                fd, tmp = tempfile.mkstemp(dir=str(km.config_dir), suffix='.tmp')
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(config, f, indent=2)
+                os.replace(tmp, str(config_file))
+            except Exception:
+                pass
+
+            os.environ["NARE_API_KEY"] = license_key
+            os.environ["ANTHROPIC_BASE_URL"] = "https://api.nare.ai"
+            ui.console.print("  [green]Configured Cortex Cloud API (api.nare.ai)[/]")
+
+        ui.console.print()
+
+
 COMMANDS: list[Command] = [
     HelpCommand(),
     AgentCommand(),
@@ -856,6 +1055,7 @@ COMMANDS: list[Command] = [
     TestCommand(),
     BenchCommand(),
     ResumeCommand(),
+    SetupCommand(),
     ExitCommand(),
 ]
 

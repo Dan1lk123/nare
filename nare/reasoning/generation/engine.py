@@ -80,6 +80,10 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
         'anthropic-beta': 'prompt-caching-2024-07-31'
     }
 
+    nare_license = os.getenv("NARE_API_KEY", "")
+    if nare_license:
+        headers['Authorization'] = f'Bearer {nare_license}'
+
     retries = 5
     for attempt in range(retries):
         req = urllib.request.Request(url, data=data, headers=headers)
@@ -87,29 +91,46 @@ def _post_anthropic(endpoint: str, payload: dict, stream_callback=None) -> str:
             with urllib.request.urlopen(req, timeout=120) as response:
 
                 if stream_callback:
-                    content_parts = []
+                    import codecs
                     import sys
+                    content_parts = []
+                    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+                    buffer = ""
 
                     while True:
-                        line = response.readline()
-                        if not line:
+                        chunk = response.read(4096)
+                        if not chunk:
                             break
+                        buffer += decoder.decode(chunk)
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line_str = line.strip()
+                            if line_str.startswith('data: '):
+                                try:
+                                    event_data = json.loads(line_str[6:])
+                                    if event_data.get('type') == 'content_block_delta':
+                                        delta = event_data.get('delta', {})
+                                        text = delta.get('text', '')
+                                        if text:
+                                            content_parts.append(text)
+                                            stream_callback(text)
+                                            sys.stdout.flush()
+                                except json.JSONDecodeError:
+                                    continue
 
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-
-                        if line_str.startswith('data: '):
-                            try:
-                                event_data = json.loads(line_str[6:])
-
-                                if event_data.get('type') == 'content_block_delta':
-                                    delta = event_data.get('delta', {})
-                                    text = delta.get('text', '')
-                                    if text:
-                                        content_parts.append(text)
-                                        stream_callback(text)
-                                        sys.stdout.flush()
-                            except json.JSONDecodeError:
-                                continue
+                    remaining = decoder.decode(b'', final=True)
+                    if remaining:
+                        buffer += remaining
+                    if buffer.strip().startswith('data: '):
+                        try:
+                            event_data = json.loads(buffer.strip()[6:])
+                            if event_data.get('type') == 'content_block_delta':
+                                text = event_data.get('delta', {}).get('text', '')
+                                if text:
+                                    content_parts.append(text)
+                                    stream_callback(text)
+                        except json.JSONDecodeError:
+                            pass
 
                     return ''.join(content_parts)
                 else:
@@ -1022,6 +1043,7 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
     negative_pass = 0
     positive_total = 0
     positive_no_crash = 0
+    positive_oracle_pass = 0
 
     for ep in stress_eps:
         is_negative = ep.get('type') == 'NEGATIVE'
@@ -1042,6 +1064,10 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
             result_str = str(result).strip()
             if not result_str.startswith("Error"):
                 positive_no_crash += 1
+                if vcfg.include_positive_stress and oracle is not None:
+                    ok, _ = oracle(ep['query'], result_str)
+                    if ok:
+                        positive_oracle_pass += 1
         except Exception as e:
             if is_negative:
                 negative_total += 1
@@ -1050,6 +1076,7 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
 
     negative_trap_accuracy = negative_pass / negative_total if negative_total > 0 else 1.0
     positive_no_crash_rate = positive_no_crash / positive_total if positive_total > 0 else 1.0
+    positive_oracle_rate = positive_oracle_pass / positive_total if positive_total > 0 else 1.0
 
     overall = (
         vcfg.w_trigger * trigger_accuracy
@@ -1057,6 +1084,11 @@ def _validate_skill(python_code: str, episodes: list, oracle: Optional["Oracle"]
         + vcfg.w_negative_trap * negative_trap_accuracy
     )
     weight_sum = vcfg.w_trigger + vcfg.w_execute + vcfg.w_negative_trap
+
+    if vcfg.include_positive_stress:
+        overall += vcfg.w_positive_stress * positive_oracle_rate
+        weight_sum += vcfg.w_positive_stress
+
     overall = overall / weight_sum if weight_sum > 0 else 0.0
 
     if trigger_accuracy < vcfg.minimum_trigger_accuracy or execute_accuracy < vcfg.minimum_execute_accuracy:
